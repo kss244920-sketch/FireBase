@@ -116,7 +116,7 @@ class APKScanner:
                     if ver_match:
                         self.results["version"] = ver_match.group(1)
 
-                    code_match = re.search(r'android:versionCode=["']([^"']+)["']', text)
+                    code_match = re.search(r'android:versionCode=["\']([^"\']+)["\']', text)
                     if code_match:
                         self.results["build_code"] = code_match.group(1)
 
