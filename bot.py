@@ -112,7 +112,7 @@ class APKScanner:
                         self.results["package"] = pkg_match.group(1)
 
                     # Version info
-                    ver_match = re.search(r'android:versionName=["']([^"']+)["']', text)
+                    ver_match = re.search(r'android:versionName=["\']([^"\']+)["\']', text)
                     if ver_match:
                         self.results["version"] = ver_match.group(1)
 
