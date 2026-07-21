@@ -359,10 +359,9 @@ else:
 
 
     if api.get("app_id"):
-        lines.append(f"📱 App ID:
-`{api['app_id']}`")
-    else:
-        lines.append(f"📱 App ID: ❌ Not found")
+    lines.append(f"📱 App ID: {api['app_id']}")
+else:
+    lines.append("📱 App ID: ❌ Not found")
 
     if api.get("oauth_clients"):
         lines.append(f"🔗 OAuth Clients:")
