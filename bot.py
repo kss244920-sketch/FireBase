@@ -349,13 +349,14 @@ def get_scan_text(results, file_size="Unknown"):
     lines.append("")
 
     # API Credentials
-    api = results.get("api_credentials", {})
-    lines.append(f"{e['key']} **API Credentials**")
-    if api.get("google_api_key"):
-        lines.append(f"🔑 Google API Key:
-`{api['google_api_key']}`")
-    else:
-        lines.append(f"🔑 Google API Key: ❌ Not found")
+api = results.get("api_credentials", {})
+lines.append(f"{E['key']} **API Credentials**")
+
+if api.get("google_api_key"):
+    lines.append(f"🔑 Google API Key: {api['google_api_key']}")
+else:
+    lines.append("🔑 Google API Key: ❌ Not found")
+
 
     if api.get("app_id"):
         lines.append(f"📱 App ID:
