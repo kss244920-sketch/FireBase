@@ -107,7 +107,7 @@ class APKScanner:
                 if manifest_data:
                     # Simple regex extraction for package name
                     text = manifest_data.decode('utf-8', errors='ignore')
-                    pkg_match = re.search(r'package=["']([^"']+)["']', text)
+                    pkg_match = re.search(r'package=["\']([^"\']+)["\']', text)
                     if pkg_match:
                         self.results["package"] = pkg_match.group(1)
 
