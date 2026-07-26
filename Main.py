@@ -1,8 +1,8 @@
 """
 AnneBella Firebase Extractor Bot
 Extracts Firebase configs & API credentials from APK files
-Author: @AnneBella
-Brand: Annebella Firebase
+Author: @OwKarma
+Brand: Marco Firebase
 """
 
 import os
@@ -21,15 +21,16 @@ from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeFilename
 
 # ==================== CONFIG ====================
-API_ID = 22602867
-API_HASH = "7e2042dde2f4a8278cbe9d3bebae8ac5"
-BOT_TOKEN = "8758625921:AAFLeP4IzKR-d_MVjYzrlEAs7GhVfgFDV30"
-OWNER_ID = 8179406947
-OWNER_USERNAME = "@AnneBella"
-LOG_CHANNEL = -1003950236084
-LOG_CHANNEL_URL = "https://t.me/firebaselogs"
-BRAND_NAME = "Annebella Firebase"
-BOT_USERNAME = "@AnnebellaFirebaseBot"
+API_ID = 31663810
+API_HASH = "c26da3d5cb8b74057b2a90aacd6d0931"
+BOT_TOKEN = "8233786680:AAGSKKf0W9wkbP90A7DJUAE6rDuaITa8Pdg"
+OWNER_ID = 8327850869
+OWNER_USERNAME = "@OwAtom"
+LOG_CHANNEL = -1003810383682
+LOG_CHANNEL_URL = "https://t.me/OwAbyss"
+BRAND_NAME = "Marco FireBase"
+BOT_USERNAME = "@Ksiffj_bot"
+
 
 # Premium emoji IDs (fallback to unicode if not available)
 EMOJIS = {
