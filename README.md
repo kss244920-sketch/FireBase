@@ -1,4 +1,4 @@
-# AnneBella Firebase Extractor Bot
+# MARCO Firebase Extractor Bot
 
 A Telegram bot that extracts Firebase configuration and API credentials from Android APK files.
 
