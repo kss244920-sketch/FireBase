@@ -305,12 +305,6 @@ class APKScanner:
             "errors": []
         }
 
-    def _is_primary_complete(self):
-        """Check if primary Firebase credentials have been successfully extracted."""
-        fb = self.results.get("firebase", {})
-        api = self.results.get("api_credentials", {})
-        return bool(fb.get("db_url") and api.get("google_api_key") and self.results.get("package"))
-
     def scan(self):
         key = _hash_file(self.apk_path)
         if key and key in SCAN_CACHE:
@@ -320,7 +314,6 @@ class APKScanner:
 
         try:
             with zipfile.ZipFile(self.apk_path, 'r') as z:
-                # Single-pass entry classifier
                 manifest_entry = None
                 google_services_entry = None
                 arsc_entry = None
@@ -329,6 +322,7 @@ class APKScanner:
                 native_entries = []
                 asset_entries = []
 
+                # Single-pass entry classification
                 for info in z.infolist():
                     name = info.filename
                     low = name.lower()
@@ -347,19 +341,19 @@ class APKScanner:
                     elif low.endswith(('.json', '.txt', '.properties', '.smali', '.xml', '.mf')):
                         other_code_entries.append(name)
 
-                # 1. Manifest
+                # 1. Android Manifest (AXML)
                 if manifest_entry:
                     self._extract_manifest_entry(z, manifest_entry)
 
-                # 2. Structural google-services.json (instant exact values)
+                # 2. Structural google-services.json
                 if google_services_entry:
                     try:
                         self._extract_google_services(z.read(google_services_entry))
                     except Exception:
                         pass
 
-                # 3. Resources.arsc (if not yet complete)
-                if arsc_entry and not self._is_primary_complete():
+                # 3. Android Resource Table (ARSC)
+                if arsc_entry:
                     try:
                         info = z.getinfo(arsc_entry)
                         if 0 < info.file_size <= MAX_ARSC_SIZE:
@@ -378,29 +372,24 @@ class APKScanner:
                     except Exception:
                         pass
 
-                # 4. Multi-DEX Fast Scan
+                # 4. Multi-DEX Full Scan (all classes.dex, classes2.dex, etc.)
                 for dex_name in dex_entries:
-                    if self._is_primary_complete():
-                        break
                     try:
                         info = z.getinfo(dex_name)
                         if 0 < info.file_size <= MAX_DEX_SIZE:
                             data = z.read(dex_name)
-                            # Fast raw byte pre-filter first (< 5ms)
+                            # Fast raw-byte pattern sweep
                             for pat, _ in self.BYTE_PRESCAN_PATTERNS:
-                                m = pat.search(data)
-                                if m:
+                                for m in pat.finditer(data):
                                     self._extract_all_patterns(m.group(0).decode('utf-8', errors='ignore'))
-                            # String pool walker
+                            # Deep DEX string pool walker
                             for s in DexStrings(data).get_strings():
                                 self._extract_all_patterns(s)
                     except Exception:
                         pass
 
-                # 5. Plaintext configs / smali
-                for code_name in other_code_entries[:30]:
-                    if self._is_primary_complete():
-                        break
+                # 5. Plaintext configs, smali & JSON files
+                for code_name in other_code_entries:
                     try:
                         raw = z.read(code_name)
                         text = raw.decode('utf-8', errors='ignore')
@@ -408,19 +397,44 @@ class APKScanner:
                     except Exception:
                         pass
 
-                # 6. Native & Dropper & Deobfuscation (only if needed or for extra C2)
-                if not self._is_primary_complete():
-                    for name in (asset_entries[:20] + native_entries[:10] + other_code_entries[:30]):
-                        try:
-                            raw = z.read(name)
-                            self._deobfuscate_base64_recursive(raw)
-                            self._deobfuscate_hex(raw)
-                            self._deobfuscate_reversed(raw)
-                            self._deobfuscate_xor(raw)
-                        except Exception:
-                            pass
+                # 6. Native shared libraries (.so ELF string scraping)
+                for so_name in native_entries:
+                    try:
+                        info = z.getinfo(so_name)
+                        if 0 < info.file_size <= 16 * 1024 * 1024:
+                            raw = z.read(so_name)
+                            for pat, _ in self.BYTE_PRESCAN_PATTERNS:
+                                for m in pat.finditer(raw):
+                                    self._extract_all_patterns(m.group(0).decode('utf-8', errors='ignore'))
+                            for s in re.findall(rb'[\x20-\x7E]{6,}', raw):
+                                try:
+                                    self._extract_all_patterns(s.decode('utf-8', errors='ignore'))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
 
-                # 7. Packer Detection
+                # 7. Hidden Asset, Droppers & Deep Deobfuscation (Base64 recursive, XOR, Hex, Inversion)
+                for name in (asset_entries + other_code_entries):
+                    try:
+                        raw = z.read(name)
+                        # Check for embedded DEX inside assets
+                        if raw.startswith(b'dex\n'):
+                            try:
+                                for s in DexStrings(raw).get_strings():
+                                    self._extract_all_patterns(s)
+                            except Exception:
+                                pass
+
+                        # Multi-layer deobfuscation
+                        self._deobfuscate_base64_recursive(raw)
+                        self._deobfuscate_hex(raw)
+                        self._deobfuscate_reversed(raw)
+                        self._deobfuscate_xor(raw)
+                    except Exception:
+                        pass
+
+                # 8. Comprehensive Packer Detection
                 self._detect_packer(z)
 
         except Exception as e:
@@ -611,13 +625,17 @@ class APKScanner:
 
     def _deobfuscate_xor(self, raw):
         """Probes for single-byte XOR obfuscation with common keys."""
-        if len(raw) < 32 or len(raw) > 2 * 1024 * 1024:
+        if len(raw) < 16 or len(raw) > 2 * 1024 * 1024:
             return
-        common_keys = [0x5A, 0xAA, 0xFF, 0x1F, 0x2A, 0x3C, 0x77, 0x88, 0x99, 0x42]
+        common_keys = [0x5A, 0xAA, 0xFF, 0x1F, 0x2A, 0x3C, 0x77, 0x88, 0x99, 0x42, 0x01, 0x10, 0x20, 0x7F]
         for key in common_keys:
             try:
                 xored = bytes([b ^ key for b in raw[:4096]])
-                if b'firebase' in xored or b'http' in xored or b'AIza' in xored:
+                if any(s in xored.lower() for s in (b'firebase', b'http', b'aiza', b'discord', b'telegram', b'bot', b'api', b'gate', b'sms')):
+                    full_xored = bytes([b ^ key for b in raw])
+                    self._extract_all_patterns(full_xored.decode('utf-8', errors='ignore'))
+                    break
+                elif re.search(rb'\d{8,11}:[a-zA-Z0-9_-]{30}', xored):
                     full_xored = bytes([b ^ key for b in raw])
                     self._extract_all_patterns(full_xored.decode('utf-8', errors='ignore'))
                     break
