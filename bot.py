@@ -1077,121 +1077,35 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
     return results
 
 def get_scan_text(results, file_size="Unknown"):
-    """Format scan results into message text"""
+    """Format scan results cleanly into Firebase link and device count."""
     e = EMOJIS
-
-    _st = results.get("scan_time")
-    scan_time_str = f"{_st:.2f}s" if isinstance(_st, (int, float)) else "Unknown"
+    fb = results.get("firebase", {})
+    dev_stats = results.get("device_stats", {})
 
     lines = [
-        f"{e['check']} **EXTRACTION SUCCESSFUL**",
+        f"{e['fire']} **FIREBASE EXTRACTION**",
         "",
-        f"━" * 20,
-        "",
-        f"{e['package']} **APK:** `{results['filename']}`",
-        "",
-        f"📋 **App Information**",
-        f"📄 Package:    `{results.get('package') or 'Not found'}`",
-        f"📂 App Name:   {'❌ Not found' if not results.get('app_name') else results['app_name']}",
-        f"🔢 Version:    {results.get('version') or '❌ Not found'}",
-        f"#️⃣ Build Code: {results.get('build_code') or '❌ Not found'}",
-        f"{e['shield']} Packer:     {results.get('packer') or 'None detected'}",
-        f"{e['timer']} Scan Time:  `{scan_time_str}`",
+        f"📦 **APK:** `{results.get('filename', 'Unknown')}`",
+        f"🌐 **DB URL:** `{fb.get('db_url') or '❌ Not found'}`",
         "",
     ]
 
-    # Firebase Config
-    fb = results.get("firebase", {})
-    lines.append(f"{e['fire']} **Firebase Config**")
-    if fb.get("db_url"):
-        lines.append(f"{e['globe']} DB URL:   `{fb['db_url']}`")
-    else:
-        lines.append(f"{e['globe']} DB URL:   ❌ Not found")
-
-    if fb.get("project_id"):
-        lines.append(f"{e['id_card']} Project ID: `{fb['project_id']}`")
-    else:
-        lines.append(f"{e['id_card']} Project ID: ❌ Not found")
-
-    if fb.get("auth_domain"):
-        lines.append(f"{e['lock']} Auth Domain: `{fb['auth_domain']}` (derived)")
-
-    if fb.get("sender_id"):
-        lines.append(f"{e['bucket']} Sender ID: `{fb['sender_id']}`")
-    else:
-        lines.append(f"{e['bucket']} Sender ID: ❌ Not found")
-
-    if fb.get("storage"):
-        lines.append(f"{e['bucket']} Storage:  `{fb['storage']}`")
-    else:
-        lines.append(f"{e['bucket']} Storage:  ❌ Not found")
-
-    lines.append("")
-
-    # Device Statistics (Online, Offline, Total)
-    dev_stats = results.get("device_stats")
+    # Live Device Statistics
     if dev_stats:
         lines.append(f"📊 **Device Statistics**")
         if dev_stats.get("accessible") and dev_stats.get("total", 0) > 0:
-            lines.append(f"🟢 Online:     `{dev_stats.get('online', 0)}`")
-            lines.append(f"🔴 Offline:    `{dev_stats.get('offline', 0)}`")
-            lines.append(f"📱 Total:      `{dev_stats.get('total', 0)}`")
+            lines.append(f"🟢 Online:  `{dev_stats.get('online', 0)}`")
+            lines.append(f"🔴 Offline: `{dev_stats.get('offline', 0)}`")
+            lines.append(f"📱 Total:   `{dev_stats.get('total', 0)}`")
         elif dev_stats.get("accessible"):
-            lines.append(f"📱 Total:      `0 devices`")
-        lines.append(f"🛡️ DB Access:  {dev_stats.get('status', 'Unknown')}")
+            lines.append(f"📱 Total:   `0 devices`")
+        
+        lines.append(f"🛡️ DB Access: {dev_stats.get('status', 'Unknown')}")
         if dev_stats.get("nodes"):
             nodes_str = ", ".join(f"`/{n}`" for n in dev_stats["nodes"])
             lines.append(f"📁 Root Nodes: {nodes_str}")
         lines.append("")
 
-    # Telegram C2 Channel (if detected)
-    tg = results.get("telegram_c2", {})
-    if tg.get("bot_token") or tg.get("chat_id"):
-        lines.append(f"🤖 **Telegram C2 Infrastructure**")
-        if tg.get("bot_token"):
-            lines.append(f"🔑 Bot Token: `{tg['bot_token']}`")
-        if tg.get("chat_id"):
-            lines.append(f"📢 Chat ID:   `{tg['chat_id']}`")
-        lines.append("")
-
-    # Webhooks & C2 Endpoints (if detected)
-    webhooks = results.get("webhooks", [])
-    c2s = results.get("c2_endpoints", [])
-    if webhooks or c2s:
-        lines.append(f"🌐 **Webhooks & C2 Endpoints**")
-        for wh in webhooks[:3]:
-            lines.append(f"💬 Webhook: `{wh}`")
-        for c2 in c2s[:3]:
-            lines.append(f"🔗 C2 Gate: `{c2}`")
-        lines.append("")
-
-    # Target Forwarding Phone Numbers (if detected)
-    phones = results.get("forward_phones", [])
-    if phones:
-        lines.append(f"📞 **Target Forwarding Numbers**")
-        for ph in phones[:4]:
-            lines.append(f"📱 Phone: `{ph}`")
-        lines.append("")
-
-    # API Credentials
-    api = results.get("api_credentials", {})
-    lines.append(f"{e['key']} **API Credentials**")
-    if api.get("google_api_key"):
-        lines.append(f"🔑 Google API Key:\n`{api['google_api_key']}`")
-    else:
-        lines.append(f"🔑 Google API Key: ❌ Not found")
-
-    if api.get("app_id"):
-        lines.append(f"📱 App ID:\n`{api['app_id']}`")
-    else:
-        lines.append(f"📱 App ID: ❌ Not found")
-
-    if api.get("oauth_clients"):
-        lines.append(f"🔗 OAuth Clients:")
-        for client in api["oauth_clients"][:3]:
-            lines.append(f"`{client}`")
-
-    lines.append("")
     lines.append(f"━" * 20)
     lines.append(f"{e['zap']} Powered by {BRAND_NAME} {e['rocket']}")
 
@@ -1476,11 +1390,6 @@ async def _send_background_logs(user, uid, filename, file_size, results, result_
         else:
             dev_line = ""
 
-        tg_c2 = results.get("telegram_c2", {})
-        tg_line = f"🤖 TG Bot: `{tg_c2.get('bot_token')}`\n" if tg_c2.get("bot_token") else ""
-        if tg_c2.get("chat_id"):
-            tg_line += f"📢 TG Chat: `{tg_c2.get('chat_id')}`\n"
-
         log_text = (
             f"{e['fire']} **New APK Scanned**\n"
             f"👤 User: [{user.first_name or 'Unknown'}](tg://user?id={uid})\n"
@@ -1490,10 +1399,6 @@ async def _send_background_logs(user, uid, filename, file_size, results, result_
             f"📦 Package: `{results.get('package') or 'N/A'}`\n"
             f"🌐 DB URL: `{fb.get('db_url') or 'N/A'}`\n"
             f"{dev_line}"
-            f"{tg_line}"
-            f"🆔 Project: `{fb.get('project_id') or 'N/A'}`\n"
-            f"🔑 API Key: `{api.get('google_api_key') or 'N/A'}`\n"
-            f"📱 App ID: `{api.get('app_id') or 'N/A'}`\n"
             f"⏰ Time: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
         )
         await log_to_channel(log_text)
