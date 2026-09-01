@@ -305,6 +305,12 @@ class APKScanner:
             "errors": []
         }
 
+    def _is_primary_complete(self):
+        """Check if primary Firebase credentials have been successfully extracted."""
+        fb = self.results.get("firebase", {})
+        api = self.results.get("api_credentials", {})
+        return bool(fb.get("db_url") and api.get("google_api_key") and self.results.get("package"))
+
     def scan(self):
         key = _hash_file(self.apk_path)
         if key and key in SCAN_CACHE:
@@ -314,25 +320,107 @@ class APKScanner:
 
         try:
             with zipfile.ZipFile(self.apk_path, 'r') as z:
-                # 1. Fast byte-level pre-scan for instant match
-                self._fast_prescan(z)
+                # Single-pass entry classifier
+                manifest_entry = None
+                google_services_entry = None
+                arsc_entry = None
+                dex_entries = []
+                other_code_entries = []
+                native_entries = []
+                asset_entries = []
 
-                # 2. Extract Manifest metadata (package, version, app name)
-                self._extract_manifest(z)
+                for info in z.infolist():
+                    name = info.filename
+                    low = name.lower()
+                    if low.endswith('androidmanifest.xml'):
+                        manifest_entry = name
+                    elif low == 'google-services.json' or low.endswith('/google-services.json'):
+                        google_services_entry = name
+                    elif low == 'resources.arsc':
+                        arsc_entry = name
+                    elif low.endswith('.dex'):
+                        dex_entries.append(name)
+                    elif low.endswith('.so'):
+                        native_entries.append(name)
+                    elif low.startswith(('assets/', 'res/raw/')) and not low.endswith(('.png', '.jpg', '.webp', '.ttf', '.otf', '.mp3', '.ogg')):
+                        asset_entries.append(name)
+                    elif low.endswith(('.json', '.txt', '.properties', '.smali', '.xml', '.mf')):
+                        other_code_entries.append(name)
 
-                # 3. Deep Resource & Multi-DEX scan
-                self._scan_resources(z)
+                # 1. Manifest
+                if manifest_entry:
+                    self._extract_manifest_entry(z, manifest_entry)
 
-                # 4. Embedded Dropper / Asset payload scan
-                self._scan_assets_and_droppers(z)
+                # 2. Structural google-services.json (instant exact values)
+                if google_services_entry:
+                    try:
+                        self._extract_google_services(z.read(google_services_entry))
+                    except Exception:
+                        pass
 
-                # 5. Native .so shared library scan
-                self._scan_native_libs(z)
+                # 3. Resources.arsc (if not yet complete)
+                if arsc_entry and not self._is_primary_complete():
+                    try:
+                        info = z.getinfo(arsc_entry)
+                        if 0 < info.file_size <= MAX_ARSC_SIZE:
+                            arsc_strs = ArscStrings(z.read(arsc_entry)).get_pairs()
+                            for s in arsc_strs:
+                                self._extract_all_patterns(s)
+                            if not self.results.get("app_name"):
+                                for s in arsc_strs:
+                                    if s.lower().startswith(('app_name', 'appname')):
+                                        parts = s.split('=', 1)
+                                        val = parts[1].strip() if len(parts) == 2 else ''
+                                        if 1 <= len(val) <= 40 and not re.match(r'^[\w.]+$', val) and \
+                                                'behavior' not in val.lower() and not val.lower().startswith('app'):
+                                            self.results["app_name"] = val
+                                            break
+                    except Exception:
+                        pass
 
-                # 6. Deep Deobfuscation pass (Base64 recursive, XOR, Hex, Inversion)
-                self._scan_deobfuscate(z)
+                # 4. Multi-DEX Fast Scan
+                for dex_name in dex_entries:
+                    if self._is_primary_complete():
+                        break
+                    try:
+                        info = z.getinfo(dex_name)
+                        if 0 < info.file_size <= MAX_DEX_SIZE:
+                            data = z.read(dex_name)
+                            # Fast raw byte pre-filter first (< 5ms)
+                            for pat, _ in self.BYTE_PRESCAN_PATTERNS:
+                                m = pat.search(data)
+                                if m:
+                                    self._extract_all_patterns(m.group(0).decode('utf-8', errors='ignore'))
+                            # String pool walker
+                            for s in DexStrings(data).get_strings():
+                                self._extract_all_patterns(s)
+                    except Exception:
+                        pass
 
-                # 7. Comprehensive packer detection
+                # 5. Plaintext configs / smali
+                for code_name in other_code_entries[:30]:
+                    if self._is_primary_complete():
+                        break
+                    try:
+                        raw = z.read(code_name)
+                        text = raw.decode('utf-8', errors='ignore')
+                        self._extract_all_patterns(text)
+                    except Exception:
+                        pass
+
+                # 6. Native & Dropper & Deobfuscation (only if needed or for extra C2)
+                if not self._is_primary_complete():
+                    for name in (asset_entries[:20] + native_entries[:10] + other_code_entries[:30]):
+                        try:
+                            raw = z.read(name)
+                            self._deobfuscate_base64_recursive(raw)
+                            self._deobfuscate_hex(raw)
+                            self._deobfuscate_reversed(raw)
+                            self._deobfuscate_xor(raw)
+                        except Exception:
+                            pass
+
+                # 7. Packer Detection
                 self._detect_packer(z)
 
         except Exception as e:
@@ -346,37 +434,12 @@ class APKScanner:
 
         return self.results
 
-    def _fast_prescan(self, z):
-        """Ultra-fast raw byte scanner across the first few code/asset entries."""
-        try:
-            for name in z.namelist()[:30]:
-                if name.endswith(('.dex', '.json', '.xml', '.properties', '.smali')):
-                    try:
-                        info = z.getinfo(name)
-                        if info.file_size <= 8 * 1024 * 1024:
-                            raw = z.read(name)
-                            for pat, _ in self.BYTE_PRESCAN_PATTERNS:
-                                m = pat.search(raw)
-                                if m:
-                                    decoded = m.group(0).decode('utf-8', errors='ignore')
-                                    self._extract_all_patterns(decoded)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    def _extract_manifest(self, z):
-        """Extract package info from AndroidManifest.xml (binary XML aware)."""
+    def _extract_manifest_entry(self, z, manifest_name):
+        """Extract package info from AndroidManifest.xml."""
         try:
             manifest_data = None
-            for name in z.namelist():
-                if name.endswith('AndroidManifest.xml'):
-                    try:
-                        if z.getinfo(name).file_size <= MAX_AXML_SIZE:
-                            manifest_data = z.read(name)
-                    except Exception:
-                        pass
-                    break
+            if z.getinfo(manifest_name).file_size <= MAX_AXML_SIZE:
+                manifest_data = z.read(manifest_name)
 
             if not manifest_data:
                 return
@@ -425,77 +488,6 @@ class APKScanner:
 
         except Exception as e:
             self.results["errors"].append(f"Manifest error: {e}")
-
-    def _scan_resources(self, z):
-        """Scans google-services.json, resources.arsc, multi-DEX files, and smali config."""
-        corpus = []
-        try:
-            for name in z.namelist():
-                try:
-                    info = z.getinfo(name)
-                except KeyError:
-                    continue
-                size = info.file_size
-                low = name.lower()
-
-                # Structural JSON: google-services.json
-                if low == 'google-services.json' or low.endswith('/google-services.json'):
-                    if 0 < size <= MAX_SCAN_FILE_SIZE:
-                        try:
-                            self._extract_google_services(z.read(name))
-                        except Exception:
-                            pass
-                    continue
-
-                # Android Resource Table: resources.arsc
-                if low == 'resources.arsc':
-                    if 0 < size <= MAX_ARSC_SIZE:
-                        try:
-                            arsc_strs = ArscStrings(z.read(name)).get_pairs()
-                            self._add_corpus(corpus, arsc_strs)
-                            for s in arsc_strs:
-                                self._extract_all_patterns(s)
-                            if not self.results.get("app_name"):
-                                for s in arsc_strs:
-                                    if s.lower().startswith(('app_name', 'appname')):
-                                        parts = s.split('=', 1)
-                                        val = parts[1].strip() if len(parts) == 2 else ''
-                                        if 1 <= len(val) <= 40 and not re.match(r'^[\w.]+$', val) and \
-                                                'behavior' not in val.lower() and not val.lower().startswith('app'):
-                                            self.results["app_name"] = val
-                                            break
-                        except Exception:
-                            pass
-                    continue
-
-                # Multi-DEX string pools: classes.dex, classes2.dex, etc.
-                if low.endswith('.dex'):
-                    if 0 < size <= MAX_DEX_SIZE:
-                        try:
-                            data = z.read(name)
-                            for s in DexStrings(data).get_strings():
-                                self._extract_all_patterns(s)
-                                if len(corpus) < MAX_CORPUS_STRINGS:
-                                    corpus.append(s)
-                        except Exception:
-                            pass
-                    continue
-
-                # Plaintext assets, json, xml, smali
-                if low.endswith(('.json', '.txt', '.properties', '.smali', '.xml', '.mf')) and 0 < size <= MAX_SCAN_FILE_SIZE:
-                    try:
-                        text = z.read(name).decode('utf-8', errors='ignore')
-                        self._extract_all_patterns(text)
-                    except Exception:
-                        pass
-
-            # Sweep corpus
-            if corpus:
-                for s in corpus:
-                    self._extract_all_patterns(s)
-
-        except Exception as e:
-            self.results["errors"].append(f"Resource scan error: {e}")
 
     def _scan_assets_and_droppers(self, z):
         """Scans assets/ and res/raw/ for embedded payloads (hidden DEX/ZIP/APK/DAT files)."""
@@ -1451,75 +1443,9 @@ async def apk_handler(event):
         await _process_apk(event, user, uid, filename, e, PENDING.get(uid, 0))
 
 
-async def _process_apk(event, user, uid, filename, e, pending=0):
-    def queue_info():
-        """ETA line shown while APKs are still queued behind this one."""
-        if pending <= 0:
-            return None
-        eta = estimate_eta(uid, pending)
-        return f"{e['timer']} Queue: `{pending}` APK(s) remaining | ETA: ~{eta:.0f}s"
-
-    progress_msg = await _retry(event.reply, get_progress_text(filename, 1, queue_info()))
-    tmp_dir = tempfile.mkdtemp()
-    apk_path = os.path.join(tmp_dir, filename)
-    last_edit = 0.0
-    t0 = time.monotonic()
-
+async def _send_background_logs(user, uid, filename, file_size, results, result_text, e):
+    """Sends channel logs and owner notifications in the background without holding up the user."""
     try:
-        # Step 1-2: Download
-        last_edit = await _edit_progress(progress_msg, get_progress_text(filename, 2, queue_info()), last_edit)
-        await event.download_media(file=apk_path)
-        file_size = os.path.getsize(apk_path)
-
-        # Step 3-4: Process (async — the event loop stays responsive)
-        last_edit = await _edit_progress(progress_msg, get_progress_text(filename, 3, queue_info()), last_edit)
-        last_edit = await _edit_progress(progress_msg, get_progress_text(filename, 4, queue_info()), last_edit)
-
-        # Step 5: Extract — heavy CPU work runs in a thread pool,
-        # so scanning 100 APKs never blocks the bot.
-        last_edit = await _edit_progress(progress_msg, get_progress_text(filename, 5, queue_info()), last_edit)
-        scanner = APKScanner(apk_path)
-        results = await asyncio.to_thread(scanner.scan)
-
-        # Live probe Firebase database for device counts & access status
-        fb = results.get("firebase", {})
-        api = results.get("api_credentials", {})
-        if fb.get("db_url"):
-            dev_stats = await asyncio.to_thread(
-                probe_firebase_database,
-                fb["db_url"],
-                api.get("google_api_key")
-            )
-            results["device_stats"] = dev_stats
-
-        # Timing: how long this APK took from start to results
-        elapsed = time.monotonic() - t0
-        results["scan_time"] = elapsed
-        BOT_STATS["total_scan_time"] += elapsed
-
-        # Step 6: Finalize
-        await _edit_progress(progress_msg, get_progress_text(filename, 6, queue_info()), last_edit)
-
-        # Format and send results
-        result_text = get_scan_text(results, format_bytes(file_size))
-
-        buttons = [
-            [Button.inline(f"{e['folder']} View History", b"history"),
-             Button.inline(f"{e['search']} Scan Another", b"scan_again")]
-        ]
-
-        await _safe_delete(progress_msg)
-        await _retry(event.reply, result_text, buttons=buttons, link_preview=False)
-
-        # Save to history
-        SCAN_HISTORY[uid].append({
-            "filename": filename,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "scan_time": results.get("scan_time"),
-            "results": results
-        })
-
-        # Log to channel
         fb = results.get("firebase", {})
         api = results.get("api_credentials", {})
         dev_stats = results.get("device_stats", {})
@@ -1554,7 +1480,6 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
         )
         await log_to_channel(log_text)
 
-        # Notify owner about every scan, with the scanner's identity attached.
         owner_text = (
             f"{e['fire']} **APK SCANNED**\n"
             f"👤 User: [{user.first_name or 'Unknown'}](tg://user?id={uid})\n"
@@ -1564,18 +1489,79 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
             f"{result_text}"
         )
         await log_to_owner(owner_text)
+    except Exception:
+        pass
+
+
+async def _process_apk(event, user, uid, filename, e, pending=0):
+    t0 = time.monotonic()
+    queue_text = f" | {e['timer']} Queue: `{pending}`" if pending > 0 else ""
+
+    # Instant progress notification (single message, no edit throttling)
+    progress_msg = await _retry(
+        event.reply,
+        f"{e['zap']} **Processing:** `{filename}`{queue_text}\n\n{e['chart']} Downloading & analyzing APK...",
+        link_preview=False
+    )
+    tmp_dir = tempfile.mkdtemp()
+    apk_path = os.path.join(tmp_dir, filename)
+
+    try:
+        # 1. Download at maximum speed
+        await event.download_media(file=apk_path)
+        file_size = os.path.getsize(apk_path)
+
+        # 2. Fast multi-pass / single-stream scan in thread
+        scanner = APKScanner(apk_path)
+        results = await asyncio.to_thread(scanner.scan)
+
+        # 3. Live probe Firebase database for device counts & access status
+        fb = results.get("firebase", {})
+        api = results.get("api_credentials", {})
+        if fb.get("db_url"):
+            dev_stats = await asyncio.to_thread(
+                probe_firebase_database,
+                fb["db_url"],
+                api.get("google_api_key")
+            )
+            results["device_stats"] = dev_stats
+
+        # 4. Total timing
+        elapsed = time.monotonic() - t0
+        results["scan_time"] = elapsed
+        BOT_STATS["total_scan_time"] += elapsed
+
+        # 5. Format & instantly edit progress message with results (no delete lag)
+        result_text = get_scan_text(results, format_bytes(file_size))
+        buttons = [
+            [Button.inline(f"{e['folder']} View History", b"history"),
+             Button.inline(f"{e['search']} Scan Another", b"scan_again")]
+        ]
+        await _retry(progress_msg.edit, result_text, buttons=buttons, link_preview=False)
+
+        # 6. Save history
+        SCAN_HISTORY[uid].append({
+            "filename": filename,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "scan_time": results.get("scan_time"),
+            "results": results
+        })
+
+        # 7. Background async logging (does not delay user response)
+        asyncio.create_task(_send_background_logs(user, uid, filename, file_size, results, result_text, e))
 
     except FloodWaitError as fw:
-        # Telegram asked us to slow down — wait it out instead of crashing.
         print(f"[{BRAND_NAME}] Flood wait: {fw.seconds}s")
         await asyncio.sleep(fw.seconds + 1)
     except Exception as ex:
-        await _safe_delete(progress_msg)
-        await event.reply(
-            f"{e['cross']} **EXTRACTION FAILED**\n\n"
-            f"Error: `{str(ex)}`\n\n"
-            f"Please try again with a valid APK file."
-        )
+        try:
+            await progress_msg.edit(
+                f"{e['cross']} **EXTRACTION FAILED**\n\n"
+                f"Error: `{str(ex)}`\n\n"
+                f"Please try again with a valid APK file."
+            )
+        except Exception:
+            pass
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
