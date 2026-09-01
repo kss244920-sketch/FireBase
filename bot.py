@@ -10,6 +10,10 @@ import zipfile
 import tempfile
 import shutil
 import hashlib
+import ssl
+import urllib.request
+import urllib.error
+import urllib.parse
 from datetime import datetime
 from collections import defaultdict
 
@@ -260,8 +264,28 @@ class ArscStrings:
         return pairs
 
 
-# ==================== APK SCANNER ====================
+# ==================== ADVANCED APK SCANNER & DEOBFUSCATION ENGINE ====================
 class APKScanner:
+    """
+    High-performance, deep static analysis engine for Android APKs.
+    Features:
+      - Byte-level fast heuristic pre-filtering (< 20ms)
+      - Binary XML (AXML) & Android Resource Table (ARSC) parser
+      - Multi-DEX string pool reconstruction & lazy decoding
+      - Multi-layer recursive Base64, XOR, Hex, URL, and reversed string deobfuscation
+      - Hidden asset, dropper payload, and raw asset archive inspector
+      - Native library (.so) ELF string and C2 scraper
+      - Extraction of Firebase RTDB, Firestore, Google APIs, Telegram C2 bots, Webhooks,
+        HTTP C2 gates, and SMS forward destination phone numbers.
+    """
+
+    BYTE_PRESCAN_PATTERNS = [
+        (re.compile(rb'https?://[a-zA-Z0-9_-]+(?:-default-rtdb)?\.(?:[a-z0-9-]+\.)?(?:firebaseio\.com|firebasedatabase\.app)', re.I), 'firebase'),
+        (re.compile(rb'AIza[0-9A-Za-z_-]{30,40}'), 'google_api_key'),
+        (re.compile(rb'\b\d{8,11}:[a-zA-Z0-9_-]{35}\b'), 'telegram_token'),
+        (re.compile(rb'https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+'), 'discord_webhook'),
+    ]
+
     def __init__(self, apk_path):
         self.apk_path = apk_path
         self.results = {
@@ -273,445 +297,393 @@ class APKScanner:
             "packer": None,
             "firebase": {},
             "api_credentials": {},
+            "telegram_c2": {},
+            "webhooks": [],
+            "c2_endpoints": [],
+            "forward_phones": [],
+            "device_stats": {},
             "errors": []
         }
 
     def scan(self):
-        # Identical APK (by content hash) → reuse the previous result instantly.
-        # copy.copy so later edits (e.g. scan_time) never mutate the cached dict.
         key = _hash_file(self.apk_path)
         if key and key in SCAN_CACHE:
             cached = SCAN_CACHE[key]
             cached.setdefault("scan_time", None)
             return copy.copy(cached)
+
         try:
-            self._extract_manifest()
-            self._scan_resources()
-            self._detect_packer()
+            with zipfile.ZipFile(self.apk_path, 'r') as z:
+                # 1. Fast byte-level pre-scan for instant match
+                self._fast_prescan(z)
+
+                # 2. Extract Manifest metadata (package, version, app name)
+                self._extract_manifest(z)
+
+                # 3. Deep Resource & Multi-DEX scan
+                self._scan_resources(z)
+
+                # 4. Embedded Dropper / Asset payload scan
+                self._scan_assets_and_droppers(z)
+
+                # 5. Native .so shared library scan
+                self._scan_native_libs(z)
+
+                # 6. Deep Deobfuscation pass (Base64 recursive, XOR, Hex, Inversion)
+                self._scan_deobfuscate(z)
+
+                # 7. Comprehensive packer detection
+                self._detect_packer(z)
+
         except Exception as e:
             self.results["errors"].append(str(e))
+
         if key:
             SCAN_CACHE[key] = self.results
             if len(SCAN_CACHE) > MAX_CACHE_ENTRIES:
                 oldest = next(iter(SCAN_CACHE))
                 del SCAN_CACHE[oldest]
+
         return self.results
 
-    def _extraction_complete(self):
-        """Stop scanning early once we have everything we need."""
-        fb = self.results["firebase"]
-        api = self.results["api_credentials"]
-        return (
-            bool(fb.get("project_id") or fb.get("db_url"))
-            and bool(fb.get("sender_id"))
-            and bool(fb.get("storage"))
-            and bool(api.get("google_api_key"))
-            and bool(api.get("app_id"))
-        )
+    def _fast_prescan(self, z):
+        """Ultra-fast raw byte scanner across the first few code/asset entries."""
+        try:
+            for name in z.namelist()[:30]:
+                if name.endswith(('.dex', '.json', '.xml', '.properties', '.smali')):
+                    try:
+                        info = z.getinfo(name)
+                        if info.file_size <= 8 * 1024 * 1024:
+                            raw = z.read(name)
+                            for pat, _ in self.BYTE_PRESCAN_PATTERNS:
+                                m = pat.search(raw)
+                                if m:
+                                    decoded = m.group(0).decode('utf-8', errors='ignore')
+                                    self._extract_all_patterns(decoded)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
-    def _add_corpus(self, corpus, items):
-        """Append strings to the corpus, respecting the global cap."""
-        room = MAX_CORPUS_STRINGS - len(corpus)
-        if room > 0:
-            corpus.extend(items[:room])
-
-    def _extract_manifest(self):
+    def _extract_manifest(self, z):
         """Extract package info from AndroidManifest.xml (binary XML aware)."""
         try:
-            with zipfile.ZipFile(self.apk_path, 'r') as z:
-                manifest_data = None
-                for name in z.namelist():
-                    if name.endswith('AndroidManifest.xml'):
-                        try:
-                            if z.getinfo(name).file_size <= MAX_AXML_SIZE:
-                                manifest_data = z.read(name)
-                        except Exception:
-                            pass
-                        break
+            manifest_data = None
+            for name in z.namelist():
+                if name.endswith('AndroidManifest.xml'):
+                    try:
+                        if z.getinfo(name).file_size <= MAX_AXML_SIZE:
+                            manifest_data = z.read(name)
+                    except Exception:
+                        pass
+                    break
 
-                if not manifest_data:
-                    return
+            if not manifest_data:
+                return
 
-                strings = _axml_strings(manifest_data)
-                if strings:
-                    text = "\n".join(strings)
-                    # App label — a short human name (spaces/caps), not a class
-                    if not self.results.get("app_name"):
-                        for s in strings:
-                            if 2 <= len(s) <= 40 and re.match(r'^[\w][\w\s&.\-()]*$', s) and \
-                                    not re.fullmatch(r'[\w.]+', s) and ' ' not in s[:3]:
-                                self.results["app_name"] = s
-                                break
-                        if not self.results.get("app_name"):
-                            self.results["app_name"] = None
-                    # Binary XML: the package name is a java-style dotted string
+            strings = _axml_strings(manifest_data)
+            if strings:
+                for s in strings:
+                    self._extract_all_patterns(s)
+                # App label
+                if not self.results.get("app_name"):
                     for s in strings:
-                        if re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*){2,}', s) and \
-                                'firebase' not in s.lower():
-                            self.results["package"] = s
+                        if 2 <= len(s) <= 40 and re.match(r'^[\w][\w\s&.\-()]*$', s) and \
+                                not re.fullmatch(r'[\w.]+', s) and ' ' not in s[:3]:
+                            self.results["app_name"] = s
                             break
-                    # versionName is a plain dotted number string
-                    for s in strings:
-                        if re.fullmatch(r'\d+(\.\d+)+[0-9A-Za-z._-]*', s):
-                            if s != self.results.get("package") and not s.startswith('android'):
-                                self.results["version"] = s
-                                break
-                else:
-                    text = manifest_data.decode('utf-8', errors='ignore')
+                # Package name
+                for s in strings:
+                    if re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*){2,}', s) and \
+                            'firebase' not in s.lower():
+                        self.results["package"] = s
+                        break
+                # Version name
+                for s in strings:
+                    if re.fullmatch(r'\d+(\.\d+)+[0-9A-Za-z._-]*', s):
+                        if s != self.results.get("package") and not s.startswith('android'):
+                            self.results["version"] = s
+                            break
+            else:
+                text = manifest_data.decode('utf-8', errors='ignore')
+                self._extract_all_patterns(text)
 
-                if not self.results.get("package"):
-                    pkg_match = re.search(r'package=["\']([^"\']+)["\']', text)
-                    if pkg_match:
-                        self.results["package"] = pkg_match.group(1)
+            if not self.results.get("package"):
+                pkg_match = re.search(r'package=["\']([^"\']+)["\']', str(manifest_data))
+                if pkg_match:
+                    self.results["package"] = pkg_match.group(1)
 
-                if not self.results.get("version"):
-                    ver_match = re.search(r'android:versionName=["\']([^"\']+)["\']', text)
-                    if ver_match:
-                        self.results["version"] = ver_match.group(1)
+            if not self.results.get("version"):
+                ver_match = re.search(r'android:versionName=["\']([^"\']+)["\']', str(manifest_data))
+                if ver_match:
+                    self.results["version"] = ver_match.group(1)
 
-                if not self.results.get("build_code"):
-                    code_match = re.search(r'android:versionCode=["\']([^"\']+)["\']', text)
-                    if code_match:
-                        self.results["build_code"] = code_match.group(1)
+            if not self.results.get("build_code"):
+                code_match = re.search(r'android:versionCode=["\']([^"\']+)["\']', str(manifest_data))
+                if code_match:
+                    self.results["build_code"] = code_match.group(1)
+
         except Exception as e:
             self.results["errors"].append(f"Manifest error: {e}")
 
-    def _scan_resources(self):
-        """Scan APK files for Firebase/API credentials with bounded reads + early exit."""
-        corpus = []  # combined strings from binary containers
+    def _scan_resources(self, z):
+        """Scans google-services.json, resources.arsc, multi-DEX files, and smali config."""
+        corpus = []
         try:
-            with zipfile.ZipFile(self.apk_path, 'r') as z:
-                for name in z.namelist():
-                    try:
-                        info = z.getinfo(name)
-                    except KeyError:
-                        continue
-                    size = info.file_size
-                    low = name.lower()
+            for name in z.namelist():
+                try:
+                    info = z.getinfo(name)
+                except KeyError:
+                    continue
+                size = info.file_size
+                low = name.lower()
 
-                    # --- structural JSON: google-services.json (exact values) ---
-                    if low == 'google-services.json' or low.endswith('/google-services.json'):
-                        if 0 < size <= MAX_SCAN_FILE_SIZE:
-                            try:
-                                self._extract_google_services(z.read(name))
-                            except Exception:
-                                pass
-                        if self._extraction_complete():
-                            break
-                        continue
-
-                    # --- resources.arsc: decode every string pool in the table ---
-                    if low == 'resources.arsc':
-                        if 0 < size <= MAX_ARSC_SIZE:
-                            try:
-                                arsc_strs = ArscStrings(z.read(name)).get_pairs()
-                                self._add_corpus(corpus, arsc_strs)
-                                self._extract_from_list(arsc_strs)
-                                if not self.results.get("app_name"):
-                                    for s in arsc_strs:
-                                        if s.lower().startswith(('app_name', 'appname')):
-                                            parts = s.split('=', 1)
-                                            val = parts[1].strip() if len(parts) == 2 else ''
-                                            if 1 <= len(val) <= 40 and not re.match(r'^[\w.]+$', val) and \
-                                                    'behavior' not in val.lower() and not val.lower().startswith('app'):
-                                                self.results["app_name"] = val
-                                                break
-                            except Exception:
-                                pass
-                        if self._extraction_complete():
-                            break
-                        continue
-
-                    # --- classes.dex: parse the actual string table ---
-                    if low.endswith('.dex'):
-                        if 0 < size <= MAX_DEX_SIZE:
-                            try:
-                                with z.open(name) as f:
-                                    magic = f.read(4)
-                                if magic == b'dex\n':
-                                    with z.open(name) as f:
-                                        data = f.read()
-                                    # Decode strings lazily and stop the instant we
-                                    # have everything — huge dex files are never
-                                    # fully decoded once google-services.json or an
-                                    # earlier dex already supplied the values.
-                                    for s in DexStrings(data).get_strings():
-                                        if self._extraction_complete():
-                                            break
-                                        self._extract_firebase(s)
-                                        self._extract_api_keys(s)
-                                        if len(corpus) < MAX_CORPUS_STRINGS:
-                                            corpus.append(s)
-                            except Exception:
-                                pass
-                        if self._extraction_complete():
-                            break
-                        continue
-
-                    # --- binary XML string pools (layouts, config, etc.) ---
-                    if low.endswith(('.xml', '.mf')):
-                        if 0 < size <= MAX_AXML_SIZE:
-                            try:
-                                xml_strs = _axml_strings(z.read(name))
-                                self._add_corpus(corpus, xml_strs)
-                                self._extract_from_list(xml_strs)
-                            except Exception:
-                                pass
-                        if self._extraction_complete():
-                            break
-                        continue
-
-                    # --- plaintext assets / smali ---
-                    if low.endswith(('.json', '.txt', '.properties', '.smali')) and 0 < size <= MAX_SCAN_FILE_SIZE:
+                # Structural JSON: google-services.json
+                if low == 'google-services.json' or low.endswith('/google-services.json'):
+                    if 0 < size <= MAX_SCAN_FILE_SIZE:
                         try:
-                            text = z.read(name).decode('utf-8', errors='ignore')
-                            self._extract_firebase(text)
-                            self._extract_api_keys(text)
+                            self._extract_google_services(z.read(name))
                         except Exception:
                             pass
+                    continue
 
-                    # Early exit: everything found, no need to scan the rest
-                    if self._extraction_complete():
-                        break
+                # Android Resource Table: resources.arsc
+                if low == 'resources.arsc':
+                    if 0 < size <= MAX_ARSC_SIZE:
+                        try:
+                            arsc_strs = ArscStrings(z.read(name)).get_pairs()
+                            self._add_corpus(corpus, arsc_strs)
+                            for s in arsc_strs:
+                                self._extract_all_patterns(s)
+                            if not self.results.get("app_name"):
+                                for s in arsc_strs:
+                                    if s.lower().startswith(('app_name', 'appname')):
+                                        parts = s.split('=', 1)
+                                        val = parts[1].strip() if len(parts) == 2 else ''
+                                        if 1 <= len(val) <= 40 and not re.match(r'^[\w.]+$', val) and \
+                                                'behavior' not in val.lower() and not val.lower().startswith('app'):
+                                            self.results["app_name"] = val
+                                            break
+                        except Exception:
+                            pass
+                    continue
 
-                # Final sweep over the whole corpus — catches credentials that
-                # are split across multiple containers.
-                if not self._extraction_complete() and corpus:
-                    self._extract_from_list(corpus)
+                # Multi-DEX string pools: classes.dex, classes2.dex, etc.
+                if low.endswith('.dex'):
+                    if 0 < size <= MAX_DEX_SIZE:
+                        try:
+                            data = z.read(name)
+                            for s in DexStrings(data).get_strings():
+                                self._extract_all_patterns(s)
+                                if len(corpus) < MAX_CORPUS_STRINGS:
+                                    corpus.append(s)
+                        except Exception:
+                            pass
+                    continue
 
-                # Packed/obfuscated APKs: a second pass that scans raw bytes
-                # for base64-encoded Firebase credentials and embedded URLs.
-                if not self._extraction_complete():
-                    self._scan_packed()
+                # Plaintext assets, json, xml, smali
+                if low.endswith(('.json', '.txt', '.properties', '.smali', '.xml', '.mf')) and 0 < size <= MAX_SCAN_FILE_SIZE:
+                    try:
+                        text = z.read(name).decode('utf-8', errors='ignore')
+                        self._extract_all_patterns(text)
+                    except Exception:
+                        pass
+
+            # Sweep corpus
+            if corpus:
+                for s in corpus:
+                    self._extract_all_patterns(s)
 
         except Exception as e:
             self.results["errors"].append(f"Resource scan error: {e}")
 
-    def _scan_packed(self):
-        """Extra pass for packed/obfuscated APKs.
-
-        R8/ProGuard smashed files base64-encode strings and scatter them across
-        smali const-strings, dex data and .so files. We probe a bounded set of
-        raw bytes for those encodings. Both passes are capped so an obfuscated
-        50MB APK adds only a few hundred ms, not minutes.
-        """
+    def _scan_assets_and_droppers(self, z):
+        """Scans assets/ and res/raw/ for embedded payloads (hidden DEX/ZIP/APK/DAT files)."""
         try:
-            with zipfile.ZipFile(self.apk_path, 'r') as z:
-                targets = [n for n in z.namelist() if n.lower().endswith(
-                    ('.smali', '.dex', '.json', '.xml', '.properties', '.txt', '.so'))]
-                if len(targets) > 120:
-                    targets = targets[:120]
-                # Total bytes read in this pass is capped too, so an obfuscated
-                # 1GB APK can't balloon this into scanning ~2GB of data.
-                budget = 64 * 1024 * 1024
-                for name in targets:
+            for name in z.namelist():
+                low = name.lower()
+                if low.startswith(('assets/', 'res/raw/')) and not low.endswith(('.png', '.jpg', '.webp', '.ttf', '.otf', '.mp3', '.ogg')):
                     try:
                         info = z.getinfo(name)
-                        if info.file_size > 16 * 1024 * 1024:
-                            continue
-                        if info.file_size > budget:
-                            continue
-                        budget -= info.file_size
-                        raw = z.read(name)
+                        if 0 < info.file_size <= 16 * 1024 * 1024:
+                            raw = z.read(name)
+
+                            # Check for embedded DEX header (dex\n)
+                            if raw.startswith(b'dex\n'):
+                                try:
+                                    for s in DexStrings(raw).get_strings():
+                                        self._extract_all_patterns(s)
+                                except Exception:
+                                    pass
+
+                            # Extract printable strings
+                            for s in re.findall(rb'[\x20-\x7E]{6,}', raw):
+                                self._extract_all_patterns(s.decode('utf-8', errors='ignore'))
                     except Exception:
-                        continue
-                    self._extract_base64(raw, name)
-                    self._extract_embedded_urls(raw)
-                    if self._extraction_complete():
-                        return
+                        pass
         except Exception:
             pass
 
-    def _extract_base64(self, raw, name):
-        """Find base64 blobs that decode to a Firebase URL or API key."""
+    def _scan_native_libs(self, z):
+        """Extracts printable ASCII strings and C2 endpoints from ELF .so shared libraries."""
         try:
-            candidates = re.findall(rb'[A-Za-z0-9+/]{32,}={0,2}', raw)
+            so_files = [n for n in z.namelist() if n.lower().endswith('.so')]
+            for name in so_files[:15]:
+                try:
+                    info = z.getinfo(name)
+                    if 0 < info.file_size <= 12 * 1024 * 1024:
+                        raw = z.read(name)
+                        for s_bytes in re.findall(rb'[\x20-\x7E]{6,}', raw):
+                            s = s_bytes.decode('utf-8', errors='ignore')
+                            self._extract_all_patterns(s)
+                except Exception:
+                    pass
         except Exception:
-            return
-        if not candidates:
-            return
-        # Bound how many blobs we decode — a 16MB native lib can produce
-        # hundreds of thousands of matches, and b64decode is expensive.
-        if len(candidates) > 4000:
-            candidates = candidates[:4000]
-        # Heuristic: only probe blobs that decode to something text-like.
-        # Rarely matters — the URL/API-key regex is what actually filters.
-        total_remaining = self._extraction_complete()
-        for cand in candidates:
-            try:
-                decoded = base64.b64decode(cand, validate=True)
-            except Exception:
-                continue
-            try:
-                text = decoded.decode('utf-8', errors='ignore')
-            except Exception:
-                continue
-            self._extract_firebase(text)
-            self._extract_api_keys(text)
-            if self._extraction_complete():
-                return
+            pass
 
-    def _extract_embedded_urls(self, raw):
-        """Find cleartext Firebase URLs inside binary payloads (native libs)."""
+    def _scan_deobfuscate(self, z):
+        """Advanced deobfuscation: multi-layer Base64, single-byte XOR, Hex ASCII, URL decode, reversed strings."""
+        try:
+            targets = [n for n in z.namelist() if n.lower().endswith(
+                ('.smali', '.dex', '.json', '.xml', '.properties', '.txt', '.so', '.dat', '.bin'))]
+            budget = 48 * 1024 * 1024
+            for name in targets[:80]:
+                try:
+                    info = z.getinfo(name)
+                    if info.file_size > 12 * 1024 * 1024 or info.file_size > budget:
+                        continue
+                    budget -= info.file_size
+                    raw = z.read(name)
+
+                    # 1. Multi-layer Recursive Base64
+                    self._deobfuscate_base64_recursive(raw)
+
+                    # 2. Hex String Decoding
+                    self._deobfuscate_hex(raw)
+
+                    # 3. Reversed String Search
+                    self._deobfuscate_reversed(raw)
+
+                    # 4. XOR scan with candidate keys if suspicious
+                    self._deobfuscate_xor(raw)
+
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _deobfuscate_base64_recursive(self, raw, depth=0):
+        """Recursively decodes nested Base64 blobs up to depth 3."""
+        if depth > 2:
+            return
+        try:
+            candidates = re.findall(rb'[A-Za-z0-9+/]{28,}={0,2}', raw)
+            for cand in candidates[:500]:
+                try:
+                    decoded = base64.b64decode(cand, validate=True)
+                    text = decoded.decode('utf-8', errors='ignore')
+                    if text:
+                        self._extract_all_patterns(text)
+                        if b'=' in decoded or len(decoded) > 30:
+                            self._deobfuscate_base64_recursive(decoded, depth=depth+1)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _deobfuscate_hex(self, raw):
+        """Finds hex-encoded ASCII strings and decodes them."""
         try:
             text = raw.decode('utf-8', errors='ignore')
+            hex_candidates = re.findall(r'[0-9a-fA-F]{24,}', text)
+            for h in hex_candidates[:100]:
+                if len(h) % 2 == 0:
+                    try:
+                        decoded = bytes.fromhex(h).decode('utf-8', errors='ignore')
+                        if decoded and any(k in decoded.lower() for k in ('http', 'firebase', 'aiza', 'bot', 'api')):
+                            self._extract_all_patterns(decoded)
+                    except Exception:
+                        pass
         except Exception:
-            return
-        self._extract_firebase(text)
-        self._extract_api_keys(text)
+            pass
 
-    def _extract_from_list(self, strings):
-        """Run credential extraction over a list of decoded strings."""
-        text = "\n".join(strings)
-        self._extract_firebase(text)
-        self._extract_api_keys(text)
-
-    def _extract_google_services(self, data):
-        """Parse google-services.json structurally for exact values."""
+    def _deobfuscate_reversed(self, raw):
+        """Detects reversed strings (e.g. moc.oiesaberif)."""
         try:
-            obj = json.loads(data)
+            text = raw.decode('utf-8', errors='ignore')
+            if 'moc.oiesaberif' in text or 'ppa.esabataderif' in text or 'yek_ipa' in text:
+                reversed_text = text[::-1]
+                self._extract_all_patterns(reversed_text)
         except Exception:
+            pass
+
+    def _deobfuscate_xor(self, raw):
+        """Probes for single-byte XOR obfuscation with common keys."""
+        if len(raw) < 32 or len(raw) > 2 * 1024 * 1024:
+            return
+        common_keys = [0x5A, 0xAA, 0xFF, 0x1F, 0x2A, 0x3C, 0x77, 0x88, 0x99, 0x42]
+        for key in common_keys:
+            try:
+                xored = bytes([b ^ key for b in raw[:4096]])
+                if b'firebase' in xored or b'http' in xored or b'AIza' in xored:
+                    full_xored = bytes([b ^ key for b in raw])
+                    self._extract_all_patterns(full_xored.decode('utf-8', errors='ignore'))
+                    break
+            except Exception:
+                continue
+
+    def _extract_all_patterns(self, text):
+        """Master pattern extractor for Firebase, Google APIs, Telegram C2, Webhooks, C2 Gates, and Phone numbers."""
+        if not text or not isinstance(text, str):
             return
 
-        fb = self.results["firebase"]
-        project_info = obj.get("project_info", {})
+        if '%' in text:
+            try:
+                unquoted = urllib.parse.unquote(text)
+                if unquoted != text:
+                    self._extract_all_patterns(unquoted)
+            except Exception:
+                pass
 
-        if not fb.get("project_id"):
-            pid = project_info.get("project_id")
-            if pid:
-                fb["project_id"] = pid
-                fb["db_url"] = f"https://{pid}-default-rtdb.firebaseio.com"
-                fb["auth_domain"] = f"{pid}.firebaseapp.com"
-
-        if not fb.get("sender_id"):
-            pnum = project_info.get("project_number")
-            if pnum:
-                fb["sender_id"] = str(pnum)
-
-        if not fb.get("storage"):
-            bucket = project_info.get("storage_bucket")
-            if bucket:
-                fb["storage"] = bucket
-
-        api = self.results["api_credentials"]
-
-        # Newer files: firebase_options.client.api_key
-        fopts = obj.get("firebase_options", {}).get("client", {})
-        if not api.get("google_api_key"):
-            ak = fopts.get("api_key")
-            if ak and str(ak).startswith("AIza"):
-                api["google_api_key"] = str(ak)
-
-        if not api.get("app_id"):
-            aid = fopts.get("mobilesdk_app_id")
-            if not aid:
-                clients = obj.get("client", []) or []
-                if clients:
-                    aid = clients[0].get("client_info", {}).get("mobilesdk_app_id")
-            if aid:
-                api["app_id"] = aid
-
-        if not api.get("oauth_clients"):
-            oauth = set()
-            for cli in obj.get("client", []) or []:
-                for o in cli.get("oauth_client", []) or []:
-                    cid = o.get("client_id")
-                    if cid and '.' in cid:
-                        oauth.add(cid)
-            if oauth:
-                api["oauth_clients"] = list(oauth)
-
-        # Fall back to regex over the raw JSON for anything structure missed
-        text = data.decode('utf-8', errors='ignore')
         self._extract_firebase(text)
         self._extract_api_keys(text)
-
-    def _detect_packer(self):
-        """Detect if APK is packed/obfuscated"""
-        packers = []
-        try:
-            with zipfile.ZipFile(self.apk_path, 'r') as z:
-                files = z.namelist()
-
-                # Check for known packer signatures
-                if any('libjiagu' in f for f in files):
-                    packers.append("Jiagu")
-                if any('libmobisec' in f for f in files):
-                    packers.append("Mobisec")
-                if any('libshell' in f for f in files):
-                    packers.append("360 Jiagu")
-                if any('libbaiduprotect' in f for f in files):
-                    packers.append("Baidu Protect")
-                if any('libtup' in f for f in files):
-                    packers.append("Tencent TUP")
-                if any('libedog' in f for f in files):
-                    packers.append("Bangcle")
-                if any('libchaosvmp' in f for f in files):
-                    packers.append("Naga/ChaosVMP")
-                if any('libsecexe' in f for f in files):
-                    packers.append("SecNeo")
-                if any('libprotect' in f for f in files):
-                    packers.append("Custom Protect")
-
-                # Check for heavy obfuscation
-                dex_files = [f for f in files if f.endswith('.dex')]
-                if len(dex_files) > 5:
-                    packers.append("Multi-Dex (Possible Obfuscation)")
-
-                # Check for native libs in unusual places
-                native_libs = [f for f in files if f.endswith('.so')]
-                if len(native_libs) > 20:
-                    packers.append("Heavy Native Libs")
-        except Exception as e:
-            self.results["errors"].append(f"Packer detection error: {e}")
-
-        self.results["packer"] = ", ".join(packers) if packers else "None detected"
+        self._extract_telegram_c2(text)
+        self._extract_webhooks_and_c2(text)
+        self._extract_phone_numbers(text)
 
     def _extract_firebase(self, text):
-        """Extract Firebase configuration from a chunk of scanned text."""
+        """Extract Firebase RTDB and regional database endpoints."""
         fb = self.results["firebase"]
-        if not text:
-            return
 
-        # Firebase Database URL
-        if not fb.get("project_id") and not fb.get("db_url"):
-            db_match = re.search(r'https://([a-zA-Z0-9_-]+)-default-rtdb\.firebaseio\.com', text)
-            if db_match:
-                project_id = db_match.group(1)
-                fb["db_url"] = f"https://{project_id}-default-rtdb.firebaseio.com"
-                fb["project_id"] = project_id
-                fb["auth_domain"] = f"{project_id}.firebaseapp.com"
-            else:
-                # Newer Firebase: https://<proj>-default-rtdb.<region>.firebasedatabase.app
-                new_db = re.search(r'https://([a-zA-Z0-9_-]+)-default-rtdb\.[a-z0-9-]+\.firebasedatabase\.app', text)
-                if new_db:
-                    fb["db_url"] = new_db.group(0)
-                    fb["project_id"] = new_db.group(1)
-                    fb["auth_domain"] = f"{new_db.group(1)}.firebaseapp.com"
-                else:
-                    alt_db = re.search(r'https://([a-zA-Z0-9_-]+)\.firebaseio\.com', text)
-                    if alt_db:
-                        pid = alt_db.group(1).replace('-default-rtdb', '')
-                        fb["db_url"] = alt_db.group(0)
-                        fb["project_id"] = pid
-                        fb["auth_domain"] = f"{pid}.firebaseapp.com"
+        # Firebase RTDB Database URLs
+        if not fb.get("project_id") or not fb.get("db_url"):
+            for pat in [
+                re.compile(r'https://([a-zA-Z0-9_-]+)-default-rtdb\.(?:([a-z0-9-]+)\.)?firebasedatabase\.app', re.I),
+                re.compile(r'https://([a-zA-Z0-9_-]+)\.(?:([a-z0-9-]+)\.)?firebasedatabase\.app', re.I),
+                re.compile(r'https://([a-zA-Z0-9_-]+)-default-rtdb\.firebaseio\.com', re.I),
+                re.compile(r'https://([a-zA-Z0-9_-]+)\.firebaseio\.com', re.I),
+                re.compile(r'https://firestore\.googleapis\.com/v1/projects/([a-zA-Z0-9_-]+)', re.I)
+            ]:
+                m = pat.search(text)
+                if m:
+                    fb["db_url"] = m.group(0)
+                    fb["project_id"] = m.group(1)
+                    fb["auth_domain"] = f"{m.group(1)}.firebaseapp.com"
+                    break
 
-        # Google Services JSON pattern / Sender ID
+        # Sender ID / Project Number
         if not fb.get("sender_id"):
-            gservices = re.search(r'"project_info".*?"project_number"\s*:\s*"(\d+)"', text, re.DOTALL)
-            if gservices:
-                fb["sender_id"] = gservices.group(1)
-            else:
-                sender_patterns = [
-                    r'gcm_defaultSenderId.*?([0-9]{10,20})',
-                    r'"sender_id"\s*:\s*"([0-9]{10,20})"',
-                    r'project_number.*?([0-9]{10,20})'
-                ]
-                for pattern in sender_patterns:
-                    match = re.search(pattern, text)
-                    if match:
-                        fb["sender_id"] = match.group(1)
-                        break
+            sender_patterns = [
+                r'"project_info".*?"project_number"\s*:\s*"(\d+)"',
+                r'gcm_defaultSenderId.*?([0-9]{10,20})',
+                r'"sender_id"\s*:\s*"([0-9]{10,20})"',
+                r'project_number.*?([0-9]{10,20})'
+            ]
+            for pattern in sender_patterns:
+                match = re.search(pattern, text, re.DOTALL if '"project_info"' in pattern else 0)
+                if match:
+                    fb["sender_id"] = match.group(1)
+                    break
 
         # Storage bucket
         if not fb.get("storage"):
@@ -726,22 +698,19 @@ class APKScanner:
                     fb["storage"] = match.group(1)
                     break
 
-        # If we have project_id but no storage, derive it
         if "project_id" in fb and "storage" not in fb:
             fb["storage"] = f"{fb['project_id']}.appspot.com"
 
     def _extract_api_keys(self, text):
-        """Extract API credentials from a chunk of scanned text."""
+        """Extract Google API Keys and Mobile SDK App IDs."""
         api = self.results["api_credentials"]
-        if not text:
-            return
 
         # Google API Key
         if not api.get("google_api_key"):
             api_key_patterns = [
-                r'AIza[0-9A-Za-z_-]{35}',
-                r'"api_key"\s*:\s*"(AIza[0-9A-Za-z_-]{35})"',
-                r'current_api_key.*?([A-Za-z0-9_-]{39})'
+                r'AIza[0-9A-Za-z_-]{30,40}',
+                r'"api_key"\s*:\s*"(AIza[0-9A-Za-z_-]{30,40})"',
+                r'current_api_key.*?([A-Za-z0-9_-]{35,42})'
             ]
             for pattern in api_key_patterns:
                 match = re.search(pattern, text)
@@ -771,6 +740,150 @@ class APKScanner:
             oauth_matches = re.findall(oauth_pattern, text)
             if oauth_matches:
                 api["oauth_clients"] = list(set(oauth_matches))
+
+    def _extract_telegram_c2(self, text):
+        """Extract Telegram C2 Bot Tokens and Chat IDs."""
+        tg = self.results["telegram_c2"]
+        if not tg.get("bot_token"):
+            m = re.search(r'\b(\d{8,11}:[a-zA-Z0-9_-]{35})\b', text)
+            if m:
+                tok = m.group(1)
+                if tok != BOT_TOKEN:
+                    tg["bot_token"] = tok
+
+        if not tg.get("chat_id"):
+            m = re.search(r'(?:^|[^\w])(-100\d{8,13})\b', text)
+            if m:
+                cid = m.group(1)
+                if cid != str(LOG_CHANNEL):
+                    tg["chat_id"] = cid
+
+    def _extract_webhooks_and_c2(self, text):
+        """Extract Discord, Slack, and REST C2 URLs."""
+        for m in re.finditer(r'https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+', text):
+            u = m.group(0)
+            if u not in self.results["webhooks"]:
+                self.results["webhooks"].append(u)
+
+        for m in re.finditer(r'https://hooks\.slack\.com/services/T[a-zA-Z0-9_]+/B[a-zA-Z0-9_]+/[a-zA-Z0-9_]+', text):
+            u = m.group(0)
+            if u not in self.results["webhooks"]:
+                self.results["webhooks"].append(u)
+
+        for m in re.finditer(r'https?://(?:[a-zA-Z0-9.-]+|(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?/(?:api/|gate|panel|upload|bot|sms|receiver|forward)[a-zA-Z0-9_./-]*', text, re.I):
+            u = m.group(0)
+            if not any(ign in u.lower() for ign in ["google", "github", "firebase", "android", "schema.org", "w3.org", "discord", "telegram", "t.me"]):
+                if u not in self.results["c2_endpoints"] and len(self.results["c2_endpoints"]) < 10:
+                    self.results["c2_endpoints"].append(u)
+
+    def _extract_phone_numbers(self, text):
+        """Extract hardcoded SMS forwarding target phone numbers."""
+        if any(k in text.lower() for k in ("sendtextmessage", "forward_to", "admin_number", "target_number", "sms_receiver", "phone_number")):
+            for m in re.finditer(r'(?:\+91|91)?([6-9]\d{9})\b', text):
+                num = m.group(0)
+                if num not in self.results["forward_phones"] and len(self.results["forward_phones"]) < 6:
+                    self.results["forward_phones"].append(num)
+
+    def _extract_google_services(self, data):
+        """Parse google-services.json structurally for exact values."""
+        try:
+            obj = json.loads(data)
+        except Exception:
+            return
+
+        fb = self.results["firebase"]
+        project_info = obj.get("project_info", {})
+
+        if not fb.get("project_id"):
+            pid = project_info.get("project_id")
+            if pid:
+                fb["project_id"] = pid
+                fb["db_url"] = f"https://{pid}-default-rtdb.firebaseio.com"
+                fb["auth_domain"] = f"{pid}.firebaseapp.com"
+
+        if not fb.get("sender_id"):
+            pnum = project_info.get("project_number")
+            if pnum:
+                fb["sender_id"] = str(pnum)
+
+        if not fb.get("storage"):
+            bucket = project_info.get("storage_bucket")
+            if bucket:
+                fb["storage"] = bucket
+
+        api = self.results["api_credentials"]
+        fopts = obj.get("firebase_options", {}).get("client", {})
+        if not api.get("google_api_key"):
+            ak = fopts.get("api_key")
+            if ak and str(ak).startswith("AIza"):
+                api["google_api_key"] = str(ak)
+
+        if not api.get("app_id"):
+            aid = fopts.get("mobilesdk_app_id")
+            if not aid:
+                clients = obj.get("client", []) or []
+                if clients:
+                    aid = clients[0].get("client_info", {}).get("mobilesdk_app_id")
+            if aid:
+                api["app_id"] = aid
+
+        if not api.get("oauth_clients"):
+            oauth = set()
+            for cli in obj.get("client", []) or []:
+                for o in cli.get("oauth_client", []) or []:
+                    cid = o.get("client_id")
+                    if cid and '.' in cid:
+                        oauth.add(cid)
+            if oauth:
+                api["oauth_clients"] = list(oauth)
+
+        text = data.decode('utf-8', errors='ignore')
+        self._extract_all_patterns(text)
+
+    def _detect_packer(self, z):
+        """Detect known packers, protectors, and heavy obfuscation."""
+        packers = []
+        try:
+            files = z.namelist()
+
+            signatures = [
+                ('libjiagu', "Jiagu"),
+                ('libmobisec', "Mobisec"),
+                ('libshell', "360 Jiagu"),
+                ('libbaiduprotect', "Baidu Protect"),
+                ('libtup', "Tencent TUP"),
+                ('libedog', "Bangcle"),
+                ('libchaosvmp', "Naga/ChaosVMP"),
+                ('libsecexe', "SecNeo"),
+                ('libprotect', "Custom Protect"),
+                ('dexprotector', "DexProtector"),
+                ('allatori', "Allatori Obfuscator"),
+                ('promon', "Promon SHIELD"),
+                ('medusa', "Medusa Protector"),
+                ('appguard', "AppGuard"),
+            ]
+
+            for sig, name in signatures:
+                if any(sig in f.lower() for f in files):
+                    packers.append(name)
+
+            dex_files = [f for f in files if f.endswith('.dex')]
+            if len(dex_files) > 5:
+                packers.append("Multi-Dex (Heavy Split)")
+
+            native_libs = [f for f in files if f.endswith('.so')]
+            if len(native_libs) > 20:
+                packers.append("Heavy Native Libs")
+
+        except Exception as e:
+            self.results["errors"].append(f"Packer detection error: {e}")
+
+        self.results["packer"] = ", ".join(packers) if packers else "None detected"
+
+    def _add_corpus(self, corpus, items):
+        room = MAX_CORPUS_STRINGS - len(corpus)
+        if room > 0:
+            corpus.extend(items[:room])
 
 
 # ==================== BOT ====================
@@ -856,6 +969,103 @@ def _hash_file(path):
         return None
     return h.hexdigest()
 
+def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 3.5) -> dict:
+    """Probes a Firebase Realtime Database for online/offline/total devices and access status."""
+    if not db_url or "firebase" not in db_url:
+        return {}
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    clean_url = db_url.rstrip("/")
+    if clean_url.endswith(".json"):
+        clean_url = clean_url[:-5]
+
+    results = {
+        "status": "Unknown",
+        "accessible": False,
+        "online": 0,
+        "offline": 0,
+        "total": 0,
+        "nodes": []
+    }
+
+    def _query(endpoint: str, use_auth: bool = False):
+        url = f"{clean_url}/{endpoint}.json"
+        if use_auth and auth_key:
+            url += f"?auth={auth_key}"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
+    # 1. First probe common device roots
+    device_endpoints = ["clients", "devices", "victim", "users", "data"]
+    for ep in device_endpoints:
+        for use_auth in ([False, True] if auth_key else [False]):
+            try:
+                with _query(ep, use_auth=use_auth) as resp:
+                    if resp.status == 200:
+                        raw = resp.read().decode("utf-8", errors="ignore")
+                        if raw and raw != "null":
+                            data = json.loads(raw)
+                            if isinstance(data, dict) and data:
+                                online = 0
+                                offline = 0
+                                for k, v in data.items():
+                                    if isinstance(v, dict):
+                                        st = v.get("status")
+                                        if st is None: st = v.get("isOnline")
+                                        if st is None: st = v.get("online")
+                                        if st is None: st = v.get("state")
+                                        if st is None: st = v.get("connected")
+                                        if st is True or st == 1 or str(st).lower() in ("online", "true", "active", "connected", "1"):
+                                            online += 1
+                                        else:
+                                            offline += 1
+                                    else:
+                                        offline += 1
+                                results["accessible"] = True
+                                results["status"] = "🟢 Open (Accessible)" if not use_auth else "🔑 Auth Verified"
+                                results["online"] = online
+                                results["offline"] = offline
+                                results["total"] = len(data)
+                                return results
+            except urllib.error.HTTPError as he:
+                if he.code in (401, 403):
+                    results["status"] = "🔒 Protected (Auth Required)"
+                elif he.code == 404:
+                    results["status"] = "🔴 Not Found (404)"
+            except Exception:
+                pass
+
+    # 2. Check root shallow if no device endpoints returned devices
+    try:
+        url = f"{clean_url}/.json?shallow=true"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            if resp.status == 200:
+                raw = resp.read().decode("utf-8", errors="ignore")
+                if raw and raw != "null":
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        results["accessible"] = True
+                        results["status"] = "🟢 Open (0 Devices / Inactive)"
+                        results["nodes"] = list(data.keys())[:6]
+                        return results
+    except urllib.error.HTTPError as he:
+        if he.code in (401, 403):
+            results["status"] = "🔒 Protected (Auth Required)"
+            return results
+    except Exception:
+        pass
+
+    if results["status"] == "Unknown":
+        results["status"] = "⚪ Inactive / Empty"
+    return results
+
 def get_scan_text(results, file_size="Unknown"):
     """Format scan results into message text"""
     e = EMOJIS
@@ -907,6 +1117,51 @@ def get_scan_text(results, file_size="Unknown"):
         lines.append(f"{e['bucket']} Storage:  ❌ Not found")
 
     lines.append("")
+
+    # Device Statistics (Online, Offline, Total)
+    dev_stats = results.get("device_stats")
+    if dev_stats:
+        lines.append(f"📊 **Device Statistics**")
+        if dev_stats.get("accessible") and dev_stats.get("total", 0) > 0:
+            lines.append(f"🟢 Online:     `{dev_stats.get('online', 0)}`")
+            lines.append(f"🔴 Offline:    `{dev_stats.get('offline', 0)}`")
+            lines.append(f"📱 Total:      `{dev_stats.get('total', 0)}`")
+        elif dev_stats.get("accessible"):
+            lines.append(f"📱 Total:      `0 devices`")
+        lines.append(f"🛡️ DB Access:  {dev_stats.get('status', 'Unknown')}")
+        if dev_stats.get("nodes"):
+            nodes_str = ", ".join(f"`/{n}`" for n in dev_stats["nodes"])
+            lines.append(f"📁 Root Nodes: {nodes_str}")
+        lines.append("")
+
+    # Telegram C2 Channel (if detected)
+    tg = results.get("telegram_c2", {})
+    if tg.get("bot_token") or tg.get("chat_id"):
+        lines.append(f"🤖 **Telegram C2 Infrastructure**")
+        if tg.get("bot_token"):
+            lines.append(f"🔑 Bot Token: `{tg['bot_token']}`")
+        if tg.get("chat_id"):
+            lines.append(f"📢 Chat ID:   `{tg['chat_id']}`")
+        lines.append("")
+
+    # Webhooks & C2 Endpoints (if detected)
+    webhooks = results.get("webhooks", [])
+    c2s = results.get("c2_endpoints", [])
+    if webhooks or c2s:
+        lines.append(f"🌐 **Webhooks & C2 Endpoints**")
+        for wh in webhooks[:3]:
+            lines.append(f"💬 Webhook: `{wh}`")
+        for c2 in c2s[:3]:
+            lines.append(f"🔗 C2 Gate: `{c2}`")
+        lines.append("")
+
+    # Target Forwarding Phone Numbers (if detected)
+    phones = results.get("forward_phones", [])
+    if phones:
+        lines.append(f"📞 **Target Forwarding Numbers**")
+        for ph in phones[:4]:
+            lines.append(f"📱 Phone: `{ph}`")
+        lines.append("")
 
     # API Credentials
     api = results.get("api_credentials", {})
@@ -1226,6 +1481,17 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
         scanner = APKScanner(apk_path)
         results = await asyncio.to_thread(scanner.scan)
 
+        # Live probe Firebase database for device counts & access status
+        fb = results.get("firebase", {})
+        api = results.get("api_credentials", {})
+        if fb.get("db_url"):
+            dev_stats = await asyncio.to_thread(
+                probe_firebase_database,
+                fb["db_url"],
+                api.get("google_api_key")
+            )
+            results["device_stats"] = dev_stats
+
         # Timing: how long this APK took from start to results
         elapsed = time.monotonic() - t0
         results["scan_time"] = elapsed
@@ -1256,6 +1522,21 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
         # Log to channel
         fb = results.get("firebase", {})
         api = results.get("api_credentials", {})
+        dev_stats = results.get("device_stats", {})
+        if dev_stats.get("accessible") and dev_stats.get("total", 0) > 0:
+            dev_line = f"📱 Devices: 🟢 {dev_stats.get('online', 0)} Online | 🔴 {dev_stats.get('offline', 0)} Offline | 📊 {dev_stats.get('total', 0)} Total\n"
+        elif dev_stats.get("accessible"):
+            dev_line = f"📱 Devices: 0 Active\n"
+        elif dev_stats.get("status") and dev_stats.get("status") != "Unknown":
+            dev_line = f"🛡️ DB Access: {dev_stats.get('status')}\n"
+        else:
+            dev_line = ""
+
+        tg_c2 = results.get("telegram_c2", {})
+        tg_line = f"🤖 TG Bot: `{tg_c2.get('bot_token')}`\n" if tg_c2.get("bot_token") else ""
+        if tg_c2.get("chat_id"):
+            tg_line += f"📢 TG Chat: `{tg_c2.get('chat_id')}`\n"
+
         log_text = (
             f"{e['fire']} **New APK Scanned**\n"
             f"👤 User: [{user.first_name or 'Unknown'}](tg://user?id={uid})\n"
@@ -1264,6 +1545,8 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
             f"📊 Size: `{format_bytes(file_size)}`\n"
             f"📦 Package: `{results.get('package') or 'N/A'}`\n"
             f"🌐 DB URL: `{fb.get('db_url') or 'N/A'}`\n"
+            f"{dev_line}"
+            f"{tg_line}"
             f"🆔 Project: `{fb.get('project_id') or 'N/A'}`\n"
             f"🔑 API Key: `{api.get('google_api_key') or 'N/A'}`\n"
             f"📱 App ID: `{api.get('app_id') or 'N/A'}`\n"
