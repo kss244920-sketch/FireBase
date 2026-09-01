@@ -65,10 +65,45 @@ EMOJIS = {
     "link": "🔗",
 }
 
+ADMIN_IDS = set([OWNER_ID])
+if os.environ.get("ADMIN_IDS"):
+    for a in os.environ.get("ADMIN_IDS").split(","):
+        if a.strip().isdigit():
+            ADMIN_IDS.add(int(a.strip()))
+
 # ==================== DATA STORAGE ====================
+USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd(), "users.json")
+
+def load_users():
+    try:
+        if os.path.exists(USERS_FILE):
+            with open(USERS_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return set(int(u) for u in data if str(u).isdigit() or isinstance(u, int))
+    except Exception:
+        pass
+    return set()
+
+def save_user(uid):
+    if not uid:
+        return
+    if uid not in BOT_STATS["total_users"]:
+        BOT_STATS["total_users"].add(uid)
+        try:
+            with open(USERS_FILE, "w") as f:
+                json.dump(list(BOT_STATS["total_users"]), f)
+        except Exception:
+            pass
+
 USER_STATS = defaultdict(lambda: {"scans": 0, "first_seen": None, "last_seen": None})
 SCAN_HISTORY = defaultdict(list)  # user_id -> list of scan results
-BOT_STATS = {"total_scans": 0, "total_users": set(), "total_scan_time": 0.0, "start_time": datetime.now()}
+BOT_STATS = {
+    "total_scans": 0,
+    "total_users": load_users(),
+    "total_scan_time": 0.0,
+    "start_time": datetime.now()
+}
 
 # Cache of completed scans keyed by APK sha1 — identical re-scans skip parsing.
 SCAN_CACHE = {}
@@ -1152,10 +1187,10 @@ async def start_handler(event):
     user = await event.get_sender()
     uid = user.id
 
-    # Update stats
+    # Update stats & save user
+    save_user(uid)
     if USER_STATS[uid]["first_seen"] is None:
         USER_STATS[uid]["first_seen"] = datetime.now()
-        BOT_STATS["total_users"].add(uid)
     USER_STATS[uid]["last_seen"] = datetime.now()
 
     e = EMOJIS
@@ -1327,6 +1362,191 @@ async def callback_handler(event):
     elif data == "scan_again":
         await event.edit(f"{e['fire']} **Send an APK to Start Scanning!**")
 
+    elif data == "admin_refresh":
+        if uid not in ADMIN_IDS:
+            return
+        uptime = datetime.now() - BOT_STATS["start_time"]
+        days = uptime.days
+        hours, rem = divmod(uptime.seconds, 3600)
+        minutes, seconds = divmod(rem, 60)
+        avg = (BOT_STATS["total_scan_time"] / BOT_STATS["total_scans"]) if BOT_STATS["total_scans"] else 0
+
+        panel_text = f"""🛡️ **ADMIN CONTROL PANEL**
+
+👥 Total Users: `{len(BOT_STATS['total_users'])}`
+📊 Total Scans: `{BOT_STATS['total_scans']}`
+⏱ Uptime: `{days}d {hours}h {minutes}m`
+⚡ Avg Scan: `{avg:.2f}s`
+
+📢 **Broadcast Options:**
+• `/broadcast <message>` — Send text announcement
+• Reply to any media with `/broadcast`
+
+◆ **{'━'*10}** ◆"""
+
+        buttons = [
+            [Button.inline(f"{e['chart']} Refresh Stats", b"admin_refresh"),
+             Button.inline(f"📢 Broadcast Help", b"admin_bcast_help")],
+            [Button.inline(f"👥 Export Users", b"admin_export_users")]
+        ]
+        await event.edit(panel_text, buttons=buttons)
+
+    elif data == "admin_bcast_help":
+        if uid not in ADMIN_IDS:
+            return
+        help_bcast = f"""📢 **BROADCAST INSTRUCTIONS**
+
+You can broadcast announcements to all registered bot users in 2 ways:
+
+1️⃣ **Text Broadcast:**
+Send `/broadcast Hello everyone! New update is live.`
+
+2️⃣ **Media / Forward Broadcast:**
+Send a photo, video, document, or audio to this chat, then **reply** to that message with `/broadcast` (or `/bcast`).
+
+⚠️ **Safety:**
+• Automatically manages flood waits.
+• Skips deactivated / blocked accounts without crashing.
+• Live real-time delivery counter."""
+        buttons = [[Button.inline("⬅️ Back to Admin Panel", b"admin_refresh")]]
+        await event.edit(help_bcast, buttons=buttons)
+
+    elif data == "admin_export_users":
+        if uid not in ADMIN_IDS:
+            return
+        total = len(BOT_STATS["total_users"])
+        user_list_str = "\n".join(str(u) for u in sorted(BOT_STATS["total_users"]))
+        if total > 0:
+            export_bytes = user_list_str.encode("utf-8")
+            await event.reply(
+                f"👥 **Total Registered Users:** `{total}`",
+                file=export_bytes,
+                attributes=[types.DocumentAttributeFilename("users_list.txt")] if "types" in globals() else None
+            )
+        else:
+            await event.reply("👥 No registered users found yet.")
+
+# ==================== ADMIN COMMANDS ====================
+@client.on(events.NewMessage(pattern=r'^/(admin|panel)'))
+async def admin_panel_handler(event):
+    uid = event.sender_id
+    if uid not in ADMIN_IDS:
+        return
+
+    e = EMOJIS
+    uptime = datetime.now() - BOT_STATS["start_time"]
+    days = uptime.days
+    hours, rem = divmod(uptime.seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    avg = (BOT_STATS["total_scan_time"] / BOT_STATS["total_scans"]) if BOT_STATS["total_scans"] else 0
+
+    panel_text = f"""🛡️ **ADMIN CONTROL PANEL**
+
+👥 Total Users: `{len(BOT_STATS['total_users'])}`
+📊 Total Scans: `{BOT_STATS['total_scans']}`
+⏱ Uptime: `{days}d {hours}h {minutes}m`
+⚡ Avg Scan: `{avg:.2f}s`
+
+📢 **Broadcast Options:**
+• `/broadcast <message>` — Send text announcement
+• Reply to any media with `/broadcast`
+
+◆ **{'━'*10}** ◆"""
+
+    buttons = [
+        [Button.inline(f"{e['chart']} Refresh Stats", b"admin_refresh"),
+         Button.inline(f"📢 Broadcast Help", b"admin_bcast_help")],
+        [Button.inline(f"👥 Export Users", b"admin_export_users")]
+    ]
+    await event.reply(panel_text, buttons=buttons)
+
+
+@client.on(events.NewMessage(pattern=r'^/(broadcast|bcast)(\s+[\s\S]+)?$'))
+async def broadcast_handler(event):
+    uid = event.sender_id
+    if uid not in ADMIN_IDS:
+        return
+
+    e = EMOJIS
+    reply_msg = await event.get_reply_message()
+    raw_text = event.pattern_match.group(2)
+    bcast_text = raw_text.strip() if raw_text else None
+
+    if not reply_msg and not bcast_text:
+        await event.reply(
+            f"{e['warning']} **Broadcast Usage:**\n\n"
+            f"1. `/broadcast Your announcement message here`\n"
+            f"2. Reply to any text, photo, video, or document with `/broadcast`"
+        )
+        return
+
+    users = list(BOT_STATS["total_users"])
+    total_users = len(users)
+    if total_users == 0:
+        await event.reply(f"{e['warning']} No registered users found to broadcast to.")
+        return
+
+    status_msg = await event.reply(
+        f"📢 **Broadcasting Started...**\n\n"
+        f"👥 Target: `{total_users}` users\n"
+        f"🟢 Sent: `0`\n"
+        f"🔴 Failed: `0`\n"
+        f"⏳ Progress: `0%`"
+    )
+
+    success = 0
+    failed = 0
+    t_start = time.monotonic()
+    last_update = 0.0
+
+    for i, target_id in enumerate(users, 1):
+        try:
+            if reply_msg:
+                # Forward or copy message/media
+                await client.send_message(target_id, reply_msg)
+            else:
+                await client.send_message(target_id, bcast_text, link_preview=False)
+            success += 1
+        except FloodWaitError as fw:
+            await asyncio.sleep(fw.seconds + 1)
+            try:
+                if reply_msg:
+                    await client.send_message(target_id, reply_msg)
+                else:
+                    await client.send_message(target_id, bcast_text, link_preview=False)
+                success += 1
+            except Exception:
+                failed += 1
+        except Exception:
+            failed += 1
+
+        # Periodic status update
+        now = time.monotonic()
+        if now - last_update >= 2.5 or i == total_users:
+            last_update = now
+            pct = int((i / total_users) * 100)
+            try:
+                await status_msg.edit(
+                    f"📢 **Broadcasting in Progress...**\n\n"
+                    f"👥 Target: `{total_users}` users\n"
+                    f"🟢 Sent: `{success}`\n"
+                    f"🔴 Failed: `{failed}`\n"
+                    f"⏳ Progress: `{pct}%` (`{i}/{total_users}`)"
+                )
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.04)
+
+    duration = time.monotonic() - t_start
+    await status_msg.edit(
+        f"✅ **Broadcast Completed!**\n\n"
+        f"👥 Total Target: `{total_users}` users\n"
+        f"🟢 Successfully Sent: `{success}`\n"
+        f"🔴 Failed / Blocked: `{failed}`\n"
+        f"⏱ Time Taken: `{duration:.1f}s`"
+    )
+
 # ==================== APK HANDLER ====================
 @client.on(events.NewMessage)
 async def apk_handler(event):
@@ -1353,11 +1573,11 @@ async def apk_handler(event):
     uid = user.id
     e = EMOJIS
 
-    # Update stats
+    # Update stats & save user
+    save_user(uid)
     USER_STATS[uid]["scans"] += 1
     USER_STATS[uid]["last_seen"] = datetime.now()
     BOT_STATS["total_scans"] += 1
-    BOT_STATS["total_users"].add(uid)
 
     # Process one upload per user at a time — prevents floods and rate limits,
     # while other users' messages are handled instantly.
