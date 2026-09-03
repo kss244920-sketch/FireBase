@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import copy
 import base64
@@ -18,6 +19,7 @@ from datetime import datetime
 from collections import defaultdict
 
 from telethon import TelegramClient, events, Button
+from telethon.tl import types
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
@@ -75,26 +77,18 @@ if os.environ.get("ADMIN_IDS"):
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd(), "users.json")
 
 def load_users():
+    users = set([OWNER_ID])
     try:
         if os.path.exists(USERS_FILE):
             with open(USERS_FILE, "r") as f:
                 data = json.load(f)
                 if isinstance(data, list):
-                    return set(int(u) for u in data if str(u).isdigit() or isinstance(u, int))
+                    for u in data:
+                        if str(u).isdigit() or isinstance(u, int):
+                            users.add(int(u))
     except Exception:
         pass
-    return set()
-
-def save_user(uid):
-    if not uid:
-        return
-    if uid not in BOT_STATS["total_users"]:
-        BOT_STATS["total_users"].add(uid)
-        try:
-            with open(USERS_FILE, "w") as f:
-                json.dump(list(BOT_STATS["total_users"]), f)
-        except Exception:
-            pass
+    return users
 
 USER_STATS = defaultdict(lambda: {"scans": 0, "first_seen": None, "last_seen": None})
 SCAN_HISTORY = defaultdict(list)  # user_id -> list of scan results
@@ -104,6 +98,23 @@ BOT_STATS = {
     "total_scan_time": 0.0,
     "start_time": datetime.now()
 }
+
+def save_user(uid):
+    if not uid:
+        return
+    try:
+        uid = int(uid)
+    except (ValueError, TypeError):
+        return
+    if uid not in BOT_STATS["total_users"]:
+        BOT_STATS["total_users"].add(uid)
+        try:
+            tmp_file = USERS_FILE + ".tmp"
+            with open(tmp_file, "w") as f:
+                json.dump(list(BOT_STATS["total_users"]), f)
+            os.replace(tmp_file, USERS_FILE)
+        except Exception:
+            pass
 
 # Cache of completed scans keyed by APK sha1 — identical re-scans skip parsing.
 SCAN_CACHE = {}
@@ -126,55 +137,75 @@ MAX_CORPUS_STRINGS = 250000            # global cap for extracted string corpus
 MAX_ARSC_CHUNKS = 50000                # safety cap for arsc chunk walker
 PROGRESS_EDIT_INTERVAL = 0.8           # seconds between progress-message edits
 
-# ==================== ANDROID BINARY XML HELPERS ====================
-def _read_utf8_len(data, pos):
-    """Read a ResStringPool variable-length UTF-8 length at pos."""
-    b = data[pos]
-    pos += 1
-    if b & 0x80:
-        b2 = data[pos]
-        pos += 1
-        return ((b & 0x7F) << 8) | b2, pos
-    return b, pos
-
-
+# ==================== ANDROID BINARY XML & RESSTRINGPOOL HELPERS ====================
 def _axml_strings(data, cap=MAX_POOL_STRINGS):
     """Extract readable strings from a binary XML / ResStringPool string pool."""
+    if not data or len(data) < 8:
+        return []
     try:
-        if len(data) < 28:
+        pool_data = data
+        ctype, hsize = struct.unpack_from('<HH', pool_data, 0)
+        # If binary XML (0x0003), the string pool chunk (0x0001) follows the XML header (usually offset 8)
+        if ctype == 0x0003:
+            pool_data = data[hsize:]
+            if len(pool_data) < 28:
+                return []
+            ctype, hsize = struct.unpack_from('<HH', pool_data, 0)
+
+        # If still not 0x0001, scan for embedded 0x0001 header in the first 512 bytes
+        if ctype != 0x0001:
+            found = False
+            for offset in range(0, min(len(data) - 28, 512), 4):
+                c_t, h_s = struct.unpack_from('<HH', data, offset)
+                if c_t == 0x0001 and h_s >= 28:
+                    pool_data = data[offset:]
+                    ctype, hsize = c_t, h_s
+                    found = True
+                    break
+            if not found:
+                return []
+
+        if len(pool_data) < 28:
             return []
-        ctype, hsize, _csize = struct.unpack_from('<HHI', data, 0)
-        if ctype != 0x0001 or hsize < 28:
-            return []
-        string_count, _style_count, flags, strings_start, _styles_start = struct.unpack_from('<IIIII', data, 8)
-        if not string_count or strings_start == 0 or strings_start > len(data):
+
+        string_count, _style_count, flags, strings_start, _styles_start = struct.unpack_from('<IIIII', pool_data, 8)
+        if not string_count or strings_start == 0 or strings_start > len(pool_data):
             return []
         string_count = min(string_count, cap)
         utf8 = bool(flags & 0x00000100)
         strings = []
         for i in range(string_count):
             off_pos = hsize + 4 * i
-            if off_pos + 4 > len(data):
+            if off_pos + 4 > len(pool_data):
                 break
-            (off,) = struct.unpack_from('<I', data, off_pos)
+            (off,) = struct.unpack_from('<I', pool_data, off_pos)
             pos = strings_start + off
-            if pos >= len(data):
+            if pos >= len(pool_data):
                 continue
-            if utf8:
-                u16len, pos = _read_utf8_len(data, pos)
-                _, pos = _read_utf8_len(data, pos)
-                end = data.find(b'\x00', pos)
-                if end == -1 or end > pos + u16len * 3 + 4:
-                    end = pos + u16len * 3 + 1
-                end = min(end, len(data))
-                s = data[pos:end].decode('utf-8', errors='ignore')
-            else:
-                slen = (data[pos] | (data[pos + 1] << 8)) & 0x7FFF
-                pos += 2
-                end = min(pos + slen * 2, len(data))
-                s = data[pos:end].decode('utf-16-le', errors='ignore')
-            if s:
-                strings.append(s)
+            try:
+                if utf8:
+                    b = pool_data[pos]; pos += 1
+                    if b & 0x80: pos += 1
+                    b = pool_data[pos]; pos += 1
+                    if b & 0x80:
+                        u8len = ((b & 0x7F) << 8) | pool_data[pos]
+                        pos += 1
+                    else:
+                        u8len = b
+                    end = min(pos + u8len, len(pool_data))
+                    s = pool_data[pos:end].decode('utf-8', errors='ignore')
+                else:
+                    slen = struct.unpack_from('<H', pool_data, pos)[0]
+                    pos += 2
+                    if slen & 0x8000:
+                        slen = ((slen & 0x7FFF) << 16) | struct.unpack_from('<H', pool_data, pos)[0]
+                        pos += 2
+                    end = min(pos + slen * 2, len(pool_data))
+                    s = pool_data[pos:end].decode('utf-16-le', errors='ignore')
+                if s:
+                    strings.append(s)
+            except Exception:
+                continue
         return strings
     except Exception:
         return []
@@ -182,10 +213,7 @@ def _axml_strings(data, cap=MAX_POOL_STRINGS):
 
 # ==================== DEX STRING TABLE PARSER ====================
 class DexStrings:
-    """Extract the string table from a .dex file (modern Android apps store
-    Firebase URLs, API keys and package names here)."""
-    # DEX header: magic(8) checksum(4) signature(20) file_size(4) header_size(4)
-    # endian_tag(4) link_size(4) link_off(4) map_off(4) string_ids_size(4) string_ids_off(4)
+    """Extract the string table from a .dex file."""
     HEADER_FMT = '<8sI20sIIIIIIII'
     HEADER_SIZE = 0x70
 
@@ -201,43 +229,38 @@ class DexStrings:
     def get_strings(self, cap=MAX_DEX_STRINGS):
         try:
             if len(self.data) < self.HEADER_SIZE:
-                return []
+                return
             (magic, _checksum, _sig, _fsize, _hsize, _endsize,
              _link_size, _link_off, _map_off, string_ids_size, string_ids_off) = \
                 struct.unpack_from(self.HEADER_FMT, self.data, 0)
             if magic[:4] != b'dex\n' or string_ids_size == 0 or string_ids_off == 0:
-                return []
+                return
             string_ids_size = min(string_ids_size, cap)
-            first_off = self._u(string_ids_off)
-            if not first_off:
-                return []
             count = 0
-            max_pos = min(self._u(string_ids_off + (string_ids_size - 1) * 4), len(self.data) - 1) if string_ids_size else 0
             for i in range(string_ids_size):
-                if max_pos and i > 0:
-                    # Dex strings often hold NUL-padding after a string; if a
-                    # string_data's address sits on the previous string's tail,
-                    # reading it is still safe (ULEB will just decode zeros).
-                    pass
                 data_off = self._u(string_ids_off + i * 4)
                 if not data_off or data_off >= len(self.data):
                     continue
                 pos = data_off
                 try:
-                    b = self.data[pos]
-                    pos += 1
-                    if b & 0x80:
-                        b2 = self.data[pos]
+                    # Proper ULEB128 variable-length integer decoding
+                    size = 0
+                    shift = 0
+                    while True:
+                        b = self.data[pos]
                         pos += 1
-                        size = ((b & 0x7F) << 8) | b2
-                    else:
-                        size = b
+                        size |= (b & 0x7F) << shift
+                        if not (b & 0x80):
+                            break
+                        shift += 7
+                        if shift > 28:
+                            break
                 except IndexError:
                     continue
-                if size <= 0 or size > 0xFFFF:
+                if size <= 0 or size > 0x100000:
                     continue
-                end = self.data.find(b'\x00', pos, min(pos + size * 4 + 1, len(self.data)))
-                if end == -1:
+                end = self.data.find(b'\x00', pos)
+                if end == -1 or end > pos + 131072:
                     continue
                 try:
                     s = self.data[pos:end].decode('utf-8', errors='ignore')
@@ -246,54 +269,35 @@ class DexStrings:
                 if s:
                     count += 1
                     yield s
-            if count == 0:
-                return []
+                    if count >= cap:
+                        break
         except Exception:
-            return []
+            return
 
 
 # ==================== ANDROID RESOURCE TABLE (resources.arsc) PARSER ====================
 class ArscStrings:
-    """Walk resources.arsc to build an exact resource key -> value map.
-
-    This finds firebase_* resources even though their names and values live in
-    separate binary chunks with no plaintext 'package=' marker anywhere."""
-
-    _KEY = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_.]*$')
+    """Walk resources.arsc to extract all strings across all string pool chunks."""
 
     def __init__(self, data):
         self.data = data
-
-    def _u(self, off, fmt='<I'):
-        try:
-            return struct.unpack_from(fmt, self.data, off)[0]
-        except struct.error:
-            return 0
 
     def get_pairs(self, cap=MAX_ARSC_CHUNKS):
         pairs = []
         try:
             d = self.data
             n = len(d)
-            off = 0
             if n < 12:
                 return pairs
-            _hsize = struct.unpack_from('<H', d, 0)[0]
-            # Android: ResTable header is 12 bytes, ResTable_package is 288.
-            # We just skip whatever header size is declared so chunks align.
-            hsize = struct.unpack_from('<H', d, 2)[0]
-            off = hsize if hsize >= 12 else 12
-            while off + 8 <= n and len(pairs) < cap:
-                ctype, _hsize, csize = struct.unpack_from('<HHI', d, off)
-                if csize < 8 or off + csize > n:
-                    break
-                if ctype == 0x0001:  # ResStringPoolHeader — decode the whole chunk
-                    string_count = self._u(off + 8)
-                    if string_count:
-                        pairs.extend(_axml_strings(d[off:off + csize], string_count))
-                    off += csize
-                else:
-                    off += csize
+            # Scan for all ResStringPoolHeader chunks (0x0001) in resources.arsc
+            for i in range(0, n - 28, 4):
+                ctype, hsize, csize = struct.unpack_from('<HHI', d, i)
+                if ctype == 0x0001 and 28 <= hsize <= csize and i + csize <= n:
+                    chunk_strings = _axml_strings(d[i:i + csize])
+                    if chunk_strings:
+                        pairs.extend(chunk_strings)
+                        if len(pairs) >= cap:
+                            break
         except Exception:
             pass
         return pairs
@@ -450,24 +454,28 @@ class APKScanner:
                         pass
 
                 # 7. Hidden Asset, Droppers & Deep Deobfuscation (Base64 recursive, XOR, Hex, Inversion)
-                for name in (asset_entries + other_code_entries):
-                    try:
-                        raw = z.read(name)
-                        # Check for embedded DEX inside assets
-                        if raw.startswith(b'dex\n'):
-                            try:
-                                for s in DexStrings(raw).get_strings():
-                                    self._extract_all_patterns(s)
-                            except Exception:
-                                pass
+                # If Firebase credentials already found, skip expensive asset deobfuscation for max speed
+                if not self.results["firebase"].get("db_url"):
+                    for name in (asset_entries + other_code_entries)[:40]:
+                        try:
+                            raw = z.read(name)
+                            # Check for embedded DEX inside assets
+                            if raw.startswith(b'dex\n'):
+                                try:
+                                    for s in DexStrings(raw).get_strings():
+                                        self._extract_all_patterns(s)
+                                except Exception:
+                                    pass
 
-                        # Multi-layer deobfuscation
-                        self._deobfuscate_base64_recursive(raw)
-                        self._deobfuscate_hex(raw)
-                        self._deobfuscate_reversed(raw)
-                        self._deobfuscate_xor(raw)
-                    except Exception:
-                        pass
+                            # Multi-layer deobfuscation
+                            self._deobfuscate_base64_recursive(raw)
+                            self._deobfuscate_hex(raw)
+                            self._deobfuscate_reversed(raw)
+                            self._deobfuscate_xor(raw)
+                            if self.results["firebase"].get("db_url"):
+                                break
+                        except Exception:
+                            pass
 
                 # 8. Comprehensive Packer Detection
                 self._detect_packer(z)
@@ -500,14 +508,15 @@ class APKScanner:
                 # App label
                 if not self.results.get("app_name"):
                     for s in strings:
-                        if 2 <= len(s) <= 40 and re.match(r'^[\w][\w\s&.\-()]*$', s) and \
-                                not re.fullmatch(r'[\w.]+', s) and ' ' not in s[:3]:
+                        if 2 <= len(s) <= 40 and re.match(r'^[a-zA-Z][\w\s&.\-()]*$', s) and \
+                                not re.fullmatch(r'[\w.]+', s) and not s.lower().startswith(('uses-', 'android', 'androidx', 'com.', 'lib', 'meta-')) and ' ' in s:
                             self.results["app_name"] = s
                             break
                 # Package name
+                ignore_pkgs = ('android.', 'androidx.', 'kotlin.', 'kotlinx.', 'java.', 'javax.', 'com.google.', 'com.android.')
                 for s in strings:
-                    if re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*){2,}', s) and \
-                            'firebase' not in s.lower():
+                    if re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+', s) and \
+                            'firebase' not in s.lower() and not s.startswith(ignore_pkgs):
                         self.results["package"] = s
                         break
                 # Version name
@@ -698,22 +707,36 @@ class APKScanner:
 
     def _extract_firebase(self, text):
         """Extract Firebase RTDB and regional database endpoints."""
+        if not text or not isinstance(text, str):
+            return
         fb = self.results["firebase"]
 
+        # Normalize escaped slashes often found in JSON / DEX strings
+        clean_text = text.replace('\\/', '/')
+
         # Firebase RTDB Database URLs
-        if not fb.get("project_id") or not fb.get("db_url"):
+        if not fb.get("db_url"):
             for pat in [
-                re.compile(r'https://([a-zA-Z0-9_-]+)-default-rtdb\.(?:([a-z0-9-]+)\.)?firebasedatabase\.app', re.I),
-                re.compile(r'https://([a-zA-Z0-9_-]+)\.(?:([a-z0-9-]+)\.)?firebasedatabase\.app', re.I),
-                re.compile(r'https://([a-zA-Z0-9_-]+)-default-rtdb\.firebaseio\.com', re.I),
-                re.compile(r'https://([a-zA-Z0-9_-]+)\.firebaseio\.com', re.I),
-                re.compile(r'https://firestore\.googleapis\.com/v1/projects/([a-zA-Z0-9_-]+)', re.I)
+                re.compile(r'(?:https?:)?(?://)?([a-zA-Z0-9_-]+-default-rtdb\.(?:[a-z0-9-]+\.)?firebasedatabase\.app)', re.I),
+                re.compile(r'(?:https?:)?(?://)?([a-zA-Z0-9_-]+\.(?:[a-z0-9-]+\.)?firebasedatabase\.app)', re.I),
+                re.compile(r'(?:https?:)?(?://)?([a-zA-Z0-9_-]+-default-rtdb\.firebaseio\.com)', re.I),
+                re.compile(r'(?:https?:)?(?://)?([a-zA-Z0-9_-]+\.firebaseio\.com)', re.I),
+                re.compile(r'https?://firestore\.googleapis\.com/v1/projects/([a-zA-Z0-9_-]+)', re.I),
             ]:
-                m = pat.search(text)
+                m = pat.search(clean_text)
                 if m:
-                    fb["db_url"] = m.group(0)
-                    fb["project_id"] = m.group(1)
-                    fb["auth_domain"] = f"{m.group(1)}.firebaseapp.com"
+                    val = m.group(1)
+                    if 'firestore.googleapis.com' in m.group(0):
+                        project_id = val
+                        fb["db_url"] = f"https://{project_id}-default-rtdb.firebaseio.com"
+                        fb["project_id"] = project_id
+                        fb["auth_domain"] = f"{project_id}.firebaseapp.com"
+                    else:
+                        domain = val
+                        fb["db_url"] = f"https://{domain}"
+                        project_id = domain.split('.')[0].replace('-default-rtdb', '')
+                        fb["project_id"] = project_id
+                        fb["auth_domain"] = f"{project_id}.firebaseapp.com"
                     break
 
         # Sender ID / Project Number
@@ -725,7 +748,7 @@ class APKScanner:
                 r'project_number.*?([0-9]{10,20})'
             ]
             for pattern in sender_patterns:
-                match = re.search(pattern, text, re.DOTALL if '"project_info"' in pattern else 0)
+                match = re.search(pattern, clean_text, re.DOTALL if '"project_info"' in pattern else 0)
                 if match:
                     fb["sender_id"] = match.group(1)
                     break
@@ -738,7 +761,7 @@ class APKScanner:
                 r'storageBucket.*?([a-zA-Z0-9_-]+\.appspot\.com)'
             ]
             for pattern in storage_patterns:
-                match = re.search(pattern, text)
+                match = re.search(pattern, clean_text)
                 if match:
                     fb["storage"] = match.group(1)
                     break
@@ -839,11 +862,16 @@ class APKScanner:
         fb = self.results["firebase"]
         project_info = obj.get("project_info", {})
 
+        furl = project_info.get("firebase_url")
+        if furl and not fb.get("db_url"):
+            fb["db_url"] = furl
+
         if not fb.get("project_id"):
             pid = project_info.get("project_id")
             if pid:
                 fb["project_id"] = pid
-                fb["db_url"] = f"https://{pid}-default-rtdb.firebaseio.com"
+                if not fb.get("db_url"):
+                    fb["db_url"] = f"https://{pid}-default-rtdb.firebaseio.com"
                 fb["auth_domain"] = f"{pid}.firebaseapp.com"
 
         if not fb.get("sender_id"):
@@ -900,7 +928,12 @@ class APKScanner:
                 ('libedog', "Bangcle"),
                 ('libchaosvmp', "Naga/ChaosVMP"),
                 ('libsecexe', "SecNeo"),
+                ('libsecneo', "SecNeo"),
                 ('libprotect', "Custom Protect"),
+                ('np.protect', "NP Protect / NP Manager"),
+                ('libnp', "NP Protect"),
+                ('mtbin', "MT Manager"),
+                ('libmtprotect', "MT Protect"),
                 ('dexprotector', "DexProtector"),
                 ('allatori', "Allatori Obfuscator"),
                 ('promon', "Promon SHIELD"),
@@ -1014,7 +1047,7 @@ def _hash_file(path):
         return None
     return h.hexdigest()
 
-def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 3.5) -> dict:
+def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 2.5) -> dict:
     """Probes a Firebase Realtime Database for online/offline/total devices and access status."""
     if not db_url or "firebase" not in db_url:
         return {}
@@ -1036,79 +1069,133 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
         "nodes": []
     }
 
-    def _query(endpoint: str, use_auth: bool = False):
-        url = f"{clean_url}/{endpoint}.json"
+    def _get(path: str, use_auth: bool = False):
+        url = f"{clean_url}/{path}"
         if use_auth and auth_key:
-            url += f"?auth={auth_key}"
+            sep = "&" if "?" in url else "?"
+            url += f"{sep}auth={auth_key}"
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         )
         return urllib.request.urlopen(req, timeout=timeout, context=ctx)
 
-    # 1. First probe common device roots
-    device_endpoints = ["clients", "devices", "victim", "users", "data"]
+    def _eval_devices(data_dict):
+        if not isinstance(data_dict, dict):
+            return 0, 0, 0
+        now = time.time()
+        online = 0
+        offline = 0
+        for dev_id, v in data_dict.items():
+            is_on = False
+            if isinstance(v, dict):
+                st = v.get("status") or v.get("isOnline") or v.get("online") or v.get("state") or v.get("connected")
+                if st is True or st == 1 or str(st).lower() in ("online", "true", "active", "connected", "1"):
+                    is_on = True
+                else:
+                    for ts_field in ("timestamp", "last_seen", "lastSeen", "lastOnline", "lastMessageTime", "time"):
+                        val = v.get(ts_field)
+                        if isinstance(val, dict):
+                            val = val.get("timestamp") or val.get("time")
+                        if val:
+                            try:
+                                t_float = float(val)
+                                if t_float > 1e12:
+                                    t_float /= 1000.0
+                                if 0 < (now - t_float) < 900:  # 15 minutes
+                                    is_on = True
+                                    break
+                            except Exception:
+                                pass
+            if is_on:
+                online += 1
+            else:
+                offline += 1
+        return online, offline, len(data_dict)
+
+    # 1. Probing device endpoints with shallow=true for ultra-fast response
+    device_endpoints = ["clients", "devices", "victim", "victims", "users", "data", "online", "bots", "phones"]
+    auth_options = [False, True] if auth_key else [False]
     for ep in device_endpoints:
-        for use_auth in ([False, True] if auth_key else [False]):
+        for use_auth in auth_options:
             try:
-                with _query(ep, use_auth=use_auth) as resp:
+                with _get(f"{ep}.json?shallow=true", use_auth=use_auth) as resp:
                     if resp.status == 200:
                         raw = resp.read().decode("utf-8", errors="ignore")
                         if raw and raw != "null":
-                            data = json.loads(raw)
-                            if isinstance(data, dict) and data:
-                                online = 0
-                                offline = 0
-                                for k, v in data.items():
-                                    if isinstance(v, dict):
-                                        st = v.get("status")
-                                        if st is None: st = v.get("isOnline")
-                                        if st is None: st = v.get("online")
-                                        if st is None: st = v.get("state")
-                                        if st is None: st = v.get("connected")
-                                        if st is True or st == 1 or str(st).lower() in ("online", "true", "active", "connected", "1"):
-                                            online += 1
-                                        else:
-                                            offline += 1
-                                    else:
-                                        offline += 1
+                            keys_dict = json.loads(raw)
+                            if isinstance(keys_dict, dict) and keys_dict:
                                 results["accessible"] = True
                                 results["status"] = "🟢 Open (Accessible)" if not use_auth else "🔑 Auth Verified"
-                                results["online"] = online
-                                results["offline"] = offline
-                                results["total"] = len(data)
+                                results["total"] = len(keys_dict)
+                                # Fetch full endpoint to evaluate online vs offline
+                                try:
+                                    with _get(f"{ep}.json", use_auth=use_auth) as full_resp:
+                                        full_data = json.loads(full_resp.read().decode("utf-8", errors="ignore"))
+                                        if isinstance(full_data, dict):
+                                            on, off, tot = _eval_devices(full_data)
+                                            results["online"] = on
+                                            results["offline"] = off
+                                            results["total"] = tot
+                                except Exception:
+                                    results["offline"] = len(keys_dict)
                                 return results
             except urllib.error.HTTPError as he:
-                if he.code in (401, 403):
+                if he.code == 402:
+                    results["status"] = "⚠️ Quota Exceeded (402 Payment Required)"
+                    return results
+                elif he.code == 423:
+                    results["status"] = "🔴 Deactivated / Suspended (423 Locked)"
+                    return results
+                elif he.code in (401, 403) and not use_auth and auth_key:
+                    continue
+                elif he.code in (401, 403):
                     results["status"] = "🔒 Protected (Auth Required)"
-                elif he.code == 404:
-                    results["status"] = "🔴 Not Found (404)"
+                    return results
+                elif he.code != 404:
+                    results["status"] = f"⚪ HTTP {he.code}"
+                    return results
             except Exception:
                 pass
 
-    # 2. Check root shallow if no device endpoints returned devices
-    try:
-        url = f"{clean_url}/.json?shallow=true"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            if resp.status == 200:
-                raw = resp.read().decode("utf-8", errors="ignore")
-                if raw and raw != "null":
-                    data = json.loads(raw)
-                    if isinstance(data, dict):
-                        results["accessible"] = True
-                        results["status"] = "🟢 Open (0 Devices / Inactive)"
-                        results["nodes"] = list(data.keys())[:6]
-                        return results
-    except urllib.error.HTTPError as he:
-        if he.code in (401, 403):
-            results["status"] = "🔒 Protected (Auth Required)"
+    # 2. Probe root shallow if device endpoints were not present (404)
+    for use_auth in auth_options:
+        try:
+            with _get(".json?shallow=true", use_auth=use_auth) as resp:
+                if resp.status == 200:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                    if raw and raw != "null":
+                        root_keys = json.loads(raw)
+                        if isinstance(root_keys, dict) and root_keys:
+                            results["accessible"] = True
+                            results["nodes"] = list(root_keys.keys())[:6]
+                            sample_keys = list(root_keys.keys())
+                            if any(re.match(r'^[a-fA-F0-9]{12,36}$', k) for k in sample_keys[:5]):
+                                results["status"] = "🟢 Open (Accessible)" if not use_auth else "🔑 Auth Verified"
+                                results["total"] = len(root_keys)
+                                results["offline"] = len(root_keys)
+                            else:
+                                results["status"] = "🟢 Open (0 Devices / Inactive)" if not use_auth else "🔑 Auth Verified (Empty)"
+                            return results
+        except urllib.error.HTTPError as he:
+            if he.code == 402:
+                results["status"] = "⚠️ Quota Exceeded (402 Payment Required)"
+            elif he.code == 423:
+                results["status"] = "🔴 Deactivated / Suspended (423 Locked)"
+            elif he.code in (401, 403) and not use_auth and auth_key:
+                continue
+            elif he.code in (401, 403):
+                results["status"] = "🔒 Protected (Auth Required)"
+            elif he.code == 404:
+                results["status"] = "🔴 Not Found (404)"
+            else:
+                results["status"] = f"⚪ HTTP {he.code}"
             return results
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     if results["status"] == "Unknown":
-        results["status"] = "⚪ Inactive / Empty"
+        results["status"] = "⚪ Inactive / Unreachable"
     return results
 
 def get_scan_text(results, file_size="Unknown"):
@@ -1182,10 +1269,13 @@ def get_progress_text(filename, step, queue_info=None):
     return "\n".join(lines)
 
 # ==================== HANDLERS ====================
-@client.on(events.NewMessage(pattern='/start'))
+@client.on(events.NewMessage(pattern=r'^/start(\s+[\s\S]+)?$'))
 async def start_handler(event):
+    uid = event.sender_id
+    if not uid:
+        return
     user = await event.get_sender()
-    uid = user.id
+    first_name = user.first_name if (user and hasattr(user, 'first_name') and user.first_name) else 'User'
 
     # Update stats & save user
     save_user(uid)
@@ -1199,7 +1289,7 @@ async def start_handler(event):
 {e['fire']} **FIREBASE EXTRACTOR BOT** {e['fire']}
 {e['zap']} **{'━'*10}** {e['zap']}
 
-👋 Hey ❖ **{user.first_name or 'User'}** ❖! Welcome to the most advanced Firebase extractor on Telegram.
+👋 Hey ❖ **{first_name}** ❖! Welcome to the most advanced Firebase extractor on Telegram.
 
 ◆ **{'━'*10}** ◆
 
@@ -1235,7 +1325,7 @@ Just send me any `.apk` file and I'll do the rest.
     # Log
     await log_to_channel(
         f"{e['zap']} **New User Started Bot**\n"
-        f"👤 Name: [{user.first_name or 'Unknown'}](tg://user?id={uid})\n"
+        f"👤 Name: [{first_name}](tg://user?id={uid})\n"
         f"🆔 ID: `{uid}`\n"
         f"📅 Time: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
     )
@@ -1274,15 +1364,18 @@ async def help_handler(event):
 
     await event.reply(help_text)
 
-@client.on(events.NewMessage(pattern='/myid'))
+@client.on(events.NewMessage(pattern=r'^/myid$'))
 async def myid_handler(event):
+    uid = event.sender_id
     user = await event.get_sender()
     e = EMOJIS
+    first_name = user.first_name if (user and hasattr(user, 'first_name') and user.first_name) else 'N/A'
+    username = f"@{user.username}" if (user and hasattr(user, 'username') and user.username) else 'N/A'
     text = f"""{e['id_card']} **YOUR PROFILE**
 
-👤 Name: {user.first_name or 'N/A'}
-🆔 User ID: `{user.id}`
-📛 Username: @{user.username or 'N/A'}
+👤 Name: {first_name}
+🆔 User ID: `{uid}`
+📛 Username: {username}
 
 ◆ **{'━'*10}** ◆"""
     await event.reply(text)
@@ -1417,11 +1510,12 @@ Send a photo, video, document, or audio to this chat, then **reply** to that mes
         total = len(BOT_STATS["total_users"])
         user_list_str = "\n".join(str(u) for u in sorted(BOT_STATS["total_users"]))
         if total > 0:
-            export_bytes = user_list_str.encode("utf-8")
+            export_bytes = io.BytesIO(user_list_str.encode("utf-8"))
+            export_bytes.name = "users_list.txt"
             await event.reply(
                 f"👥 **Total Registered Users:** `{total}`",
                 file=export_bytes,
-                attributes=[types.DocumentAttributeFilename("users_list.txt")] if "types" in globals() else None
+                attributes=[types.DocumentAttributeFilename("users_list.txt")]
             )
         else:
             await event.reply("👥 No registered users found yet.")
@@ -1502,8 +1596,18 @@ async def broadcast_handler(event):
     for i, target_id in enumerate(users, 1):
         try:
             if reply_msg:
-                # Forward or copy message/media
-                await client.send_message(target_id, reply_msg)
+                if reply_msg.media:
+                    await client.send_message(
+                        target_id,
+                        reply_msg.text or reply_msg.message or "",
+                        file=reply_msg.media
+                    )
+                else:
+                    await client.send_message(
+                        target_id,
+                        reply_msg.text or reply_msg.message or "",
+                        link_preview=False
+                    )
             else:
                 await client.send_message(target_id, bcast_text, link_preview=False)
             success += 1
@@ -1511,7 +1615,18 @@ async def broadcast_handler(event):
             await asyncio.sleep(fw.seconds + 1)
             try:
                 if reply_msg:
-                    await client.send_message(target_id, reply_msg)
+                    if reply_msg.media:
+                        await client.send_message(
+                            target_id,
+                            reply_msg.text or reply_msg.message or "",
+                            file=reply_msg.media
+                        )
+                    else:
+                        await client.send_message(
+                            target_id,
+                            reply_msg.text or reply_msg.message or "",
+                            link_preview=False
+                        )
                 else:
                     await client.send_message(target_id, bcast_text, link_preview=False)
                 success += 1
@@ -1561,16 +1676,19 @@ async def apk_handler(event):
         is_apk = True
 
     for attr in event.document.attributes:
-        if hasattr(attr, 'file_name') and attr.file_name.endswith('.apk'):
+        if hasattr(attr, 'file_name') and attr.file_name and attr.file_name.lower().endswith('.apk'):
             is_apk = True
-            filename = attr.file_name
+            filename = os.path.basename(attr.file_name)
             break
 
     if not is_apk:
         return
 
+    uid = event.sender_id
+    if not uid:
+        return
+
     user = await event.get_sender()
-    uid = user.id
     e = EMOJIS
 
     # Update stats & save user
@@ -1610,9 +1728,12 @@ async def _send_background_logs(user, uid, filename, file_size, results, result_
         else:
             dev_line = ""
 
+        user_first = user.first_name if (user and hasattr(user, 'first_name') and user.first_name) else 'Unknown'
+        user_user = f"@{user.username}" if (user and hasattr(user, 'username') and user.username) else 'N/A'
+
         log_text = (
             f"{e['fire']} **New APK Scanned**\n"
-            f"👤 User: [{user.first_name or 'Unknown'}](tg://user?id={uid})\n"
+            f"👤 User: [{user_first}](tg://user?id={uid})\n"
             f"🆔 ID: `{uid}`\n"
             f"📦 File: `{filename}`\n"
             f"📊 Size: `{format_bytes(file_size)}`\n"
@@ -1625,9 +1746,9 @@ async def _send_background_logs(user, uid, filename, file_size, results, result_
 
         owner_text = (
             f"{e['fire']} **APK SCANNED**\n"
-            f"👤 User: [{user.first_name or 'Unknown'}](tg://user?id={uid})\n"
+            f"👤 User: [{user_first}](tg://user?id={uid})\n"
             f"🆔 ID: `{uid}`\n"
-            f"📛 Username: @{user.username or 'N/A'}\n"
+            f"📛 Username: {user_user}\n"
             f"\n"
             f"{result_text}"
         )
@@ -1651,7 +1772,9 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
 
     try:
         # 1. Download at maximum speed
-        await event.download_media(file=apk_path)
+        downloaded = await event.download_media(file=apk_path)
+        if not downloaded or not os.path.exists(apk_path) or os.path.getsize(apk_path) == 0:
+            raise RuntimeError("Failed to download APK from Telegram. Please try sending the file again.")
         file_size = os.path.getsize(apk_path)
 
         # 2. Fast multi-pass / single-stream scan in thread
