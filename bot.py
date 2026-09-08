@@ -118,7 +118,7 @@ def save_user(uid):
 
 # Cache of completed scans keyed by APK sha1 — identical re-scans skip parsing.
 SCAN_CACHE = {}
-MAX_CACHE_ENTRIES = 100
+MAX_CACHE_ENTRIES = 20
 
 # Per-user lock so one user's many uploads are processed sequentially
 # (prevents floods/rate limits) while other users stay responsive.
@@ -127,14 +127,15 @@ USER_QUEUE = {}
 PENDING = {}
 
 # ==================== SPEED / SAFETY SETTINGS ====================
+MAX_UPLOAD_SIZE = 75 * 1024 * 1024     # reject APK uploads larger than 75MB to prevent container OOM
 MAX_SCAN_FILE_SIZE = 2 * 1024 * 1024   # skip plaintext files larger than 2MB
-MAX_AXML_SIZE = 8 * 1024 * 1024        # binary XML files up to 8MB
-MAX_ARSC_SIZE = 32 * 1024 * 1024       # resources.arsc up to 32MB
-MAX_DEX_SIZE = 96 * 1024 * 1024        # classes.dex up to 96MB
-MAX_DEX_STRINGS = 200000               # cap strings decoded per dex file
-MAX_POOL_STRINGS = 100000              # cap strings per binary string pool
-MAX_CORPUS_STRINGS = 250000            # global cap for extracted string corpus
-MAX_ARSC_CHUNKS = 50000                # safety cap for arsc chunk walker
+MAX_AXML_SIZE = 4 * 1024 * 1024        # binary XML files up to 4MB
+MAX_ARSC_SIZE = 16 * 1024 * 1024       # resources.arsc up to 16MB
+MAX_DEX_SIZE = 24 * 1024 * 1024        # classes.dex up to 24MB (prevent OOM spikes on Railway)
+MAX_DEX_STRINGS = 35000                # cap strings decoded per dex file
+MAX_POOL_STRINGS = 30000               # cap strings per binary string pool
+MAX_CORPUS_STRINGS = 50000             # global cap for extracted string corpus
+MAX_ARSC_CHUNKS = 15000                # safety cap for arsc chunk walker
 PROGRESS_EDIT_INTERVAL = 0.8           # seconds between progress-message edits
 
 # ==================== ANDROID BINARY XML & RESSTRINGPOOL HELPERS ====================
@@ -413,6 +414,8 @@ class APKScanner:
 
                 # 4. Multi-DEX Full Scan (all classes.dex, classes2.dex, etc.)
                 for dex_name in dex_entries:
+                    if self.results["firebase"].get("db_url") and self.results["api_credentials"].get("google_api_key"):
+                        break
                     try:
                         info = z.getinfo(dex_name)
                         if 0 < info.file_size <= MAX_DEX_SIZE:
@@ -421,37 +424,48 @@ class APKScanner:
                             for pat, _ in self.BYTE_PRESCAN_PATTERNS:
                                 for m in pat.finditer(data):
                                     self._extract_all_patterns(m.group(0).decode('utf-8', errors='ignore'))
-                            # Deep DEX string pool walker
-                            for s in DexStrings(data).get_strings():
-                                self._extract_all_patterns(s)
+                            # Deep DEX string pool walker (only if credentials not yet found)
+                            if not (self.results["firebase"].get("db_url") and self.results["api_credentials"].get("google_api_key")):
+                                for s in DexStrings(data).get_strings(cap=MAX_DEX_STRINGS):
+                                    self._extract_all_patterns(s)
+                                    if self.results["firebase"].get("db_url") and self.results["api_credentials"].get("google_api_key"):
+                                        break
                     except Exception:
                         pass
 
                 # 5. Plaintext configs, smali & JSON files
-                for code_name in other_code_entries:
-                    try:
-                        raw = z.read(code_name)
-                        text = raw.decode('utf-8', errors='ignore')
-                        self._extract_all_patterns(text)
-                    except Exception:
-                        pass
+                if not (self.results["firebase"].get("db_url") and self.results["api_credentials"].get("google_api_key")):
+                    for code_name in other_code_entries[:30]:
+                        try:
+                            raw = z.read(code_name)
+                            text = raw.decode('utf-8', errors='ignore')
+                            self._extract_all_patterns(text)
+                            if self.results["firebase"].get("db_url") and self.results["api_credentials"].get("google_api_key"):
+                                break
+                        except Exception:
+                            pass
 
                 # 6. Native shared libraries (.so ELF string scraping)
-                for so_name in native_entries:
-                    try:
-                        info = z.getinfo(so_name)
-                        if 0 < info.file_size <= 16 * 1024 * 1024:
-                            raw = z.read(so_name)
-                            for pat, _ in self.BYTE_PRESCAN_PATTERNS:
-                                for m in pat.finditer(raw):
-                                    self._extract_all_patterns(m.group(0).decode('utf-8', errors='ignore'))
-                            for s in re.findall(rb'[\x20-\x7E]{6,}', raw):
-                                try:
-                                    self._extract_all_patterns(s.decode('utf-8', errors='ignore'))
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+                if not self.results["firebase"].get("db_url"):
+                    for so_name in native_entries[:6]:
+                        try:
+                            info = z.getinfo(so_name)
+                            if 0 < info.file_size <= 8 * 1024 * 1024:
+                                raw = z.read(so_name)
+                                for pat, _ in self.BYTE_PRESCAN_PATTERNS:
+                                    for m in pat.finditer(raw):
+                                        self._extract_all_patterns(m.group(0).decode('utf-8', errors='ignore'))
+                                for s in re.findall(rb'[\x20-\x7E]{6,}', raw[:2 * 1024 * 1024]):
+                                    try:
+                                        self._extract_all_patterns(s.decode('utf-8', errors='ignore'))
+                                        if self.results["firebase"].get("db_url"):
+                                            break
+                                    except Exception:
+                                        pass
+                                if self.results["firebase"].get("db_url"):
+                                    break
+                        except Exception:
+                            pass
 
                 # 7. Hidden Asset, Droppers & Deep Deobfuscation (Base64 recursive, XOR, Hex, Inversion)
                 # If Firebase credentials already found, skip expensive asset deobfuscation for max speed
@@ -1128,17 +1142,20 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
                                 results["accessible"] = True
                                 results["status"] = "🟢 Open (Accessible)" if not use_auth else "🔑 Auth Verified"
                                 results["total"] = len(keys_dict)
-                                # Fetch full endpoint to evaluate online vs offline
-                                try:
-                                    with _get(f"{ep}.json", use_auth=use_auth) as full_resp:
-                                        full_data = json.loads(full_resp.read().decode("utf-8", errors="ignore"))
-                                        if isinstance(full_data, dict):
-                                            on, off, tot = _eval_devices(full_data)
-                                            results["online"] = on
-                                            results["offline"] = off
-                                            results["total"] = tot
-                                except Exception:
-                                    results["offline"] = len(keys_dict)
+                                results["offline"] = len(keys_dict)
+                                # Fetch full endpoint to evaluate online vs offline ONLY if device count is small (<= 15) to prevent OOM
+                                if len(keys_dict) <= 15:
+                                    try:
+                                        with _get(f"{ep}.json", use_auth=use_auth) as full_resp:
+                                            raw_bytes = full_resp.read(262144)  # Max 256KB buffer
+                                            full_data = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
+                                            if isinstance(full_data, dict):
+                                                on, off, tot = _eval_devices(full_data)
+                                                results["online"] = on
+                                                results["offline"] = off
+                                                results["total"] = tot
+                                    except Exception:
+                                        pass
                                 return results
             except urllib.error.HTTPError as he:
                 if he.code == 402:
@@ -1684,12 +1701,21 @@ async def apk_handler(event):
     if not is_apk:
         return
 
+    e = EMOJIS
+    file_size = getattr(event.document, 'size', 0)
+    if file_size > MAX_UPLOAD_SIZE:
+        await event.reply(
+            f"{e['cross']} **FILE TOO LARGE**\n\n"
+            f"The uploaded APK is `{format_bytes(file_size)}`.\n"
+            f"Maximum allowed size on this server is `{format_bytes(MAX_UPLOAD_SIZE)}` to prevent memory limits."
+        )
+        return
+
     uid = event.sender_id
     if not uid:
         return
 
     user = await event.get_sender()
-    e = EMOJIS
 
     # Update stats & save user
     save_user(uid)
@@ -1805,13 +1831,14 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
         ]
         await _retry(progress_msg.edit, result_text, buttons=buttons, link_preview=False)
 
-        # 6. Save history
+        # 6. Save history (capped to last 5 entries to prevent long-term memory leaks)
         SCAN_HISTORY[uid].append({
             "filename": filename,
             "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "scan_time": results.get("scan_time"),
-            "results": results
+            "scan_time": results.get("scan_time")
         })
+        if len(SCAN_HISTORY[uid]) > 5:
+            SCAN_HISTORY[uid] = SCAN_HISTORY[uid][-5:]
 
         # 7. Background async logging (does not delay user response)
         asyncio.create_task(_send_background_logs(user, uid, filename, file_size, results, result_text, e))
@@ -1830,6 +1857,13 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
             pass
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        try:
+            import gc
+            gc.collect()
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
 
 # ==================== MAIN ====================
@@ -1862,12 +1896,20 @@ async def _health_server(port):
 
 
 async def _health_handle(reader, writer):
-    writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
     try:
+        await asyncio.wait_for(reader.read(1024), timeout=2.0)
+    except Exception:
+        pass
+    try:
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
         await writer.drain()
     except Exception:
         pass
-    writer.close()
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     try:
