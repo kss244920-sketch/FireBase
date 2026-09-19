@@ -1873,10 +1873,9 @@ async def main():
     print(f"[{BRAND_NAME}] Bot is running!", flush=True)
     print(f"[{BRAND_NAME}] Username: {BOT_USERNAME}", flush=True)
 
-    # Minimal health endpoint so Railway/Replit see the process as healthy.
-    if os.environ.get("PORT"):
-        port = int(os.environ.get("PORT", "8080"))
-        asyncio.create_task(_health_server(port))
+    # Health endpoint for keep-alive pings and platform health checks
+    port = int(os.environ.get("PORT", "8080"))
+    asyncio.create_task(_health_server(port))
 
     try:
         await client.run_until_disconnected()
