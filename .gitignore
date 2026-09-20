@@ -5,3 +5,7 @@ __pycache__/
 .env
 users.json
 venv/
+
+jrnm_identity.token
+keep_alive.log
+
