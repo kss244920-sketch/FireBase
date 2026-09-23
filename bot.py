@@ -304,6 +304,24 @@ class ArscStrings:
         return pairs
 
 
+def safe_zip_read(z, entry_name_or_info, max_size=None):
+    """Safely read an entry from a ZipFile, bypassing Bad CRC-32 errors caused by APK anti-analysis/tampering."""
+    try:
+        if max_size is not None:
+            info = z.getinfo(entry_name_or_info) if isinstance(entry_name_or_info, str) else entry_name_or_info
+            if info.file_size > max_size:
+                return None
+        try:
+            return z.read(entry_name_or_info)
+        except zipfile.BadZipFile:
+            with z.open(entry_name_or_info, 'r') as fp:
+                if hasattr(fp, '_expected_crc'):
+                    fp._expected_crc = None
+                return fp.read()
+    except Exception:
+        return None
+
+
 # ==================== ADVANCED APK SCANNER & DEOBFUSCATION ENGINE ====================
 class APKScanner:
     """
@@ -388,16 +406,18 @@ class APKScanner:
                 # 2. Structural google-services.json
                 if google_services_entry:
                     try:
-                        self._extract_google_services(z.read(google_services_entry))
+                        raw_gs = safe_zip_read(z, google_services_entry)
+                        if raw_gs:
+                            self._extract_google_services(raw_gs)
                     except Exception:
                         pass
 
                 # 3. Android Resource Table (ARSC)
                 if arsc_entry:
                     try:
-                        info = z.getinfo(arsc_entry)
-                        if 0 < info.file_size <= MAX_ARSC_SIZE:
-                            arsc_strs = ArscStrings(z.read(arsc_entry)).get_pairs()
+                        raw_arsc = safe_zip_read(z, arsc_entry, MAX_ARSC_SIZE)
+                        if raw_arsc:
+                            arsc_strs = ArscStrings(raw_arsc).get_pairs()
                             for s in arsc_strs:
                                 self._extract_all_patterns(s)
                             if not self.results.get("app_name"):
@@ -417,9 +437,8 @@ class APKScanner:
                     if self.results["firebase"].get("db_url") and self.results["api_credentials"].get("google_api_key"):
                         break
                     try:
-                        info = z.getinfo(dex_name)
-                        if 0 < info.file_size <= MAX_DEX_SIZE:
-                            data = z.read(dex_name)
+                        data = safe_zip_read(z, dex_name, MAX_DEX_SIZE)
+                        if data:
                             # Fast raw-byte pattern sweep
                             for pat, _ in self.BYTE_PRESCAN_PATTERNS:
                                 for m in pat.finditer(data):
@@ -437,11 +456,12 @@ class APKScanner:
                 if not (self.results["firebase"].get("db_url") and self.results["api_credentials"].get("google_api_key")):
                     for code_name in other_code_entries[:30]:
                         try:
-                            raw = z.read(code_name)
-                            text = raw.decode('utf-8', errors='ignore')
-                            self._extract_all_patterns(text)
-                            if self.results["firebase"].get("db_url") and self.results["api_credentials"].get("google_api_key"):
-                                break
+                            raw = safe_zip_read(z, code_name, MAX_DEX_SIZE)
+                            if raw:
+                                text = raw.decode('utf-8', errors='ignore')
+                                self._extract_all_patterns(text)
+                                if self.results["firebase"].get("db_url") and self.results["api_credentials"].get("google_api_key"):
+                                    break
                         except Exception:
                             pass
 
@@ -449,9 +469,8 @@ class APKScanner:
                 if not self.results["firebase"].get("db_url"):
                     for so_name in native_entries[:6]:
                         try:
-                            info = z.getinfo(so_name)
-                            if 0 < info.file_size <= 8 * 1024 * 1024:
-                                raw = z.read(so_name)
+                            raw = safe_zip_read(z, so_name, 8 * 1024 * 1024)
+                            if raw:
                                 for pat, _ in self.BYTE_PRESCAN_PATTERNS:
                                     for m in pat.finditer(raw):
                                         self._extract_all_patterns(m.group(0).decode('utf-8', errors='ignore'))
@@ -472,22 +491,23 @@ class APKScanner:
                 if not self.results["firebase"].get("db_url"):
                     for name in (asset_entries + other_code_entries)[:40]:
                         try:
-                            raw = z.read(name)
-                            # Check for embedded DEX inside assets
-                            if raw.startswith(b'dex\n'):
-                                try:
-                                    for s in DexStrings(raw).get_strings():
-                                        self._extract_all_patterns(s)
-                                except Exception:
-                                    pass
+                            raw = safe_zip_read(z, name, 2 * 1024 * 1024)
+                            if raw:
+                                # Check for embedded DEX inside assets
+                                if raw.startswith(b'dex\n'):
+                                    try:
+                                        for s in DexStrings(raw).get_strings():
+                                            self._extract_all_patterns(s)
+                                    except Exception:
+                                        pass
 
-                            # Multi-layer deobfuscation
-                            self._deobfuscate_base64_recursive(raw)
-                            self._deobfuscate_hex(raw)
-                            self._deobfuscate_reversed(raw)
-                            self._deobfuscate_xor(raw)
-                            if self.results["firebase"].get("db_url"):
-                                break
+                                # Multi-layer deobfuscation
+                                self._deobfuscate_base64_recursive(raw)
+                                self._deobfuscate_hex(raw)
+                                self._deobfuscate_reversed(raw)
+                                self._deobfuscate_xor(raw)
+                                if self.results["firebase"].get("db_url"):
+                                    break
                         except Exception:
                             pass
 
@@ -508,9 +528,7 @@ class APKScanner:
     def _extract_manifest_entry(self, z, manifest_name):
         """Extract package info from AndroidManifest.xml."""
         try:
-            manifest_data = None
-            if z.getinfo(manifest_name).file_size <= MAX_AXML_SIZE:
-                manifest_data = z.read(manifest_name)
+            manifest_data = safe_zip_read(z, manifest_name, MAX_AXML_SIZE)
 
             if not manifest_data:
                 return
@@ -568,10 +586,8 @@ class APKScanner:
                 low = name.lower()
                 if low.startswith(('assets/', 'res/raw/')) and not low.endswith(('.png', '.jpg', '.webp', '.ttf', '.otf', '.mp3', '.ogg')):
                     try:
-                        info = z.getinfo(name)
-                        if 0 < info.file_size <= 16 * 1024 * 1024:
-                            raw = z.read(name)
-
+                        raw = safe_zip_read(z, name, 16 * 1024 * 1024)
+                        if raw:
                             # Check for embedded DEX header (dex\n)
                             if raw.startswith(b'dex\n'):
                                 try:
@@ -594,9 +610,8 @@ class APKScanner:
             so_files = [n for n in z.namelist() if n.lower().endswith('.so')]
             for name in so_files[:15]:
                 try:
-                    info = z.getinfo(name)
-                    if 0 < info.file_size <= 12 * 1024 * 1024:
-                        raw = z.read(name)
+                    raw = safe_zip_read(z, name, 12 * 1024 * 1024)
+                    if raw:
                         for s_bytes in re.findall(rb'[\x20-\x7E]{6,}', raw):
                             s = s_bytes.decode('utf-8', errors='ignore')
                             self._extract_all_patterns(s)
@@ -617,7 +632,9 @@ class APKScanner:
                     if info.file_size > 12 * 1024 * 1024 or info.file_size > budget:
                         continue
                     budget -= info.file_size
-                    raw = z.read(name)
+                    raw = safe_zip_read(z, name, 12 * 1024 * 1024)
+                    if not raw:
+                        continue
 
                     # 1. Multi-layer Recursive Base64
                     self._deobfuscate_base64_recursive(raw)
