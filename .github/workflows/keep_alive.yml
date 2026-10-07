@@ -1,0 +1,23 @@
+name: 24/7 Autonomous Bot Keep-Alive
+
+on:
+  schedule:
+    # Run every 30 minutes 24/7 in GitHub cloud
+    - cron: '15,45 * * * *'
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    name: Cloud Keep-Alive & Lease Renewal
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - name: Run Cloud Keep-Alive
+        env:
+          JRNM_IDENTITY: ${{ secrets.JRNM_IDENTITY }}
+        run: python scripts/keep_alive.py

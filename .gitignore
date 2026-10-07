@@ -9,3 +9,4 @@ venv/
 jrnm_identity.token
 keep_alive.log
 
+banned.json

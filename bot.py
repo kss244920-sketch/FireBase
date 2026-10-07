@@ -20,7 +20,8 @@ from collections import defaultdict
 
 from telethon import TelegramClient, events, Button
 from telethon.tl import types
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, UserNotParticipantError
+from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.sessions import StringSession
 
 # ==================== CONFIG ====================
@@ -35,6 +36,15 @@ LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "-1004313199843"))
 LOG_CHANNEL_URL = os.environ.get("LOG_CHANNEL_URL", "https://t.me/jhgghhlok")
 BRAND_NAME = os.environ.get("BRAND_NAME", "MARC")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "@Kkftinbot")
+
+# Force Subscribe Channel
+FSUB_CHANNEL = os.environ.get("FSUB_CHANNEL", "@owabyss")
+FSUB_CHANNEL_URL = os.environ.get("FSUB_CHANNEL_URL", "https://t.me/OwAbyss")
+
+# Multi-Scan Concurrency Limits (reduces queuing time dramatically)
+MAX_CONCURRENT_PER_USER = int(os.environ.get("MAX_CONCURRENT_PER_USER", "3"))
+GLOBAL_CONCURRENT_LIMIT = int(os.environ.get("GLOBAL_CONCURRENT_LIMIT", "6"))
+GLOBAL_SCAN_SEMAPHORE = asyncio.Semaphore(GLOBAL_CONCURRENT_LIMIT)
 
 # Premium emoji IDs (fallback to unicode if not available)
 EMOJIS = {
@@ -115,6 +125,64 @@ def save_user(uid):
             os.replace(tmp_file, USERS_FILE)
         except Exception:
             pass
+
+BANNED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd(), "banned.json")
+
+def load_banned():
+    banned = set()
+    try:
+        if os.path.exists(BANNED_FILE):
+            with open(BANNED_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for u in data:
+                        if str(u).isdigit() or isinstance(u, int):
+                            banned.add(int(u))
+    except Exception:
+        pass
+    return banned
+
+BANNED_USERS = load_banned()
+MAINTENANCE_MODE = False
+
+def save_banned():
+    try:
+        tmp_file = BANNED_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(list(BANNED_USERS), f)
+        os.replace(tmp_file, BANNED_FILE)
+    except Exception:
+        pass
+
+# Force subscribe channel membership verification
+async def check_fsub(uid):
+    """Returns True if user has joined required channel or is exempt, False otherwise."""
+    if uid in ADMIN_IDS:
+        return True
+    if not FSUB_CHANNEL:
+        return True
+    try:
+        await client(GetParticipantRequest(channel=FSUB_CHANNEL, user_id=uid))
+        return True
+    except UserNotParticipantError:
+        return False
+    except Exception:
+        # Fallback to True if channel resolution fails or bot is not admin in channel
+        return True
+
+def get_fsub_buttons():
+    return [
+        [Button.url("📢 Join Channel", FSUB_CHANNEL_URL)],
+        [Button.inline("✅ I've Joined", b"check_fsub_btn")]
+    ]
+
+def get_fsub_message(first_name="User"):
+    return (
+        f"⚠️ **Access Restricted!**\n\n"
+        f"Hey **{first_name}**, to use **{BRAND_NAME} Firebase Extractor**, you must join our official channel first.\n\n"
+        f"📢 **Channel:** [{FSUB_CHANNEL}]({FSUB_CHANNEL_URL})\n\n"
+        f"Join the channel using the button below, then click **I've Joined** to unlock the bot!"
+    )
 
 # Cache of completed scans keyed by APK sha1 — identical re-scans skip parsing.
 SCAN_CACHE = {}
@@ -840,6 +908,24 @@ class APKScanner:
             if oauth_matches:
                 api["oauth_clients"] = list(set(oauth_matches))
 
+        # FCM / GCM Server Key
+        if not api.get("fcm_server_key"):
+            m_fcm = re.search(r'(?:APA91b|AAAA)[0-9A-Za-z\-_:]{50,}', text)
+            if m_fcm:
+                api["fcm_server_key"] = m_fcm.group(0)
+
+        # Google Maps API Key
+        if not api.get("maps_api_key"):
+            m_maps = re.search(r'(?i)(?:maps_api_key|google_maps_key|MAPS_API_KEY)\s*[:="\'\s]+([A-Za-z0-9_-]{20,})', text)
+            if m_maps:
+                api["maps_api_key"] = m_maps.group(1)
+
+        # Hardcoded Secrets / DB Passwords
+        if not api.get("db_secret"):
+            m_sec = re.search(r'(?i)(?:admin_pass|secret_key|api_secret|db_pass)\s*[:="\'\s]+([A-Za-z0-9@#$%^&*!_-]{4,})', text)
+            if m_sec:
+                api["db_secret"] = m_sec.group(1)
+
     def _extract_telegram_c2(self, text):
         """Extract Telegram C2 Bot Tokens and Chat IDs."""
         tg = self.results["telegram_c2"]
@@ -1145,7 +1231,7 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
         return online, offline, len(data_dict)
 
     # 1. Probing device endpoints with shallow=true for ultra-fast response
-    device_endpoints = ["clients", "devices", "victim", "victims", "users", "data", "online", "bots", "phones"]
+    device_endpoints = ["clients", "devices", "victim", "victims", "users", "data", "online", "bots", "phones", "all_pas"]
     auth_options = [False, True] if auth_key else [False]
     for ep in device_endpoints:
         for use_auth in auth_options:
@@ -1232,19 +1318,81 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
         results["status"] = "⚪ Inactive / Unreachable"
     return results
 
+def format_firebase_probe_report(db_url, dev_stats):
+    """Format a standalone live database check report."""
+    e = EMOJIS
+    lines = [
+        f"🔍 **FIREBASE LIVE DIAGNOSTIC**",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 **Target URL:** `{db_url}`",
+        f"🛡️ **Status:** {dev_stats.get('status', 'Unknown')}",
+        ""
+    ]
+    if dev_stats.get("accessible"):
+        lines.append("📊 **Live Device Stats:**")
+        if dev_stats.get("total", 0) > 0:
+            lines.append(f"🟢 Online Devices:  `{dev_stats.get('online', 0)}`")
+            lines.append(f"🔴 Offline Devices: `{dev_stats.get('offline', 0)}`")
+            lines.append(f"📱 Total Devices:   `{dev_stats.get('total', 0)}`")
+        else:
+            lines.append("📱 Total Devices:   `0 devices / Inactive`")
+
+        if dev_stats.get("nodes"):
+            nodes_str = ", ".join(f"`/{n}`" for n in dev_stats["nodes"])
+            lines.append(f"📁 Root Nodes: {nodes_str}")
+        lines.append("")
+
+    lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"{e['zap']} Powered by {BRAND_NAME}")
+    return "\n".join(lines)
+
+
 def get_scan_text(results, file_size="Unknown"):
-    """Format scan results cleanly into Firebase link and device count."""
+    """Format scan results cleanly into Firebase link, credentials, and device count."""
     e = EMOJIS
     fb = results.get("firebase", {})
+    api = results.get("api_credentials", {})
+    tg = results.get("telegram_c2", {})
     dev_stats = results.get("device_stats", {})
 
     lines = [
-        f"{e['fire']} **FIREBASE EXTRACTION**",
+        f"{e['fire']} **FIREBASE EXTRACTION REPORT**",
         "",
         f"📦 **APK:** `{results.get('filename', 'Unknown')}`",
-        f"🌐 **DB URL:** `{fb.get('db_url') or '❌ Not found'}`",
-        "",
+        f"📏 **Size:** `{file_size}`",
     ]
+
+    if results.get("package"):
+        ver_str = f" v{results.get('version')}" if results.get('version') else ""
+        lines.append(f"🏷️ **Package:** `{results.get('package')}{ver_str}`")
+
+    lines.append("")
+    lines.append(f"🌐 **DB URL:** `{fb.get('db_url') or '❌ Not found'}`")
+
+    if fb.get("project_id"):
+        lines.append(f"🆔 **Project ID:** `{fb['project_id']}`")
+    if fb.get("storage"):
+        lines.append(f"🪣 **Storage:** `{fb['storage']}`")
+    if fb.get("sender_id"):
+        lines.append(f"📧 **Sender ID:** `{fb['sender_id']}`")
+
+    # API Credentials & Keys
+    if api.get("google_api_key"):
+        lines.append(f"🔑 **Google API Key:** `{api['google_api_key']}`")
+    if api.get("fcm_server_key"):
+        lines.append(f"📲 **FCM Server Key:** `{api['fcm_server_key']}`")
+    if api.get("maps_api_key"):
+        lines.append(f"🗺️ **Maps API Key:** `{api['maps_api_key']}`")
+    if api.get("db_secret"):
+        lines.append(f"🔐 **Hardcoded Secret:** `{api['db_secret']}`")
+
+    # Threat Intelligence / RAT C2
+    if tg.get("bot_token"):
+        lines.append(f"🤖 **C2 Telegram Bot:** `{tg['bot_token']}`")
+    if tg.get("chat_id"):
+        lines.append(f"💬 **C2 Chat ID:** `{tg['chat_id']}`")
+
+    lines.append("")
 
     # Live Device Statistics
     if dev_stats:
@@ -1255,7 +1403,7 @@ def get_scan_text(results, file_size="Unknown"):
             lines.append(f"📱 Total:   `{dev_stats.get('total', 0)}`")
         elif dev_stats.get("accessible"):
             lines.append(f"📱 Total:   `0 devices`")
-        
+
         lines.append(f"🛡️ DB Access: {dev_stats.get('status', 'Unknown')}")
         if dev_stats.get("nodes"):
             nodes_str = ", ".join(f"`/{n}`" for n in dev_stats["nodes"])
@@ -1308,8 +1456,18 @@ async def start_handler(event):
     uid = event.sender_id
     if not uid:
         return
+    if uid in BANNED_USERS:
+        return
+    if MAINTENANCE_MODE and uid not in ADMIN_IDS:
+        await event.reply("⚙️ **Maintenance Mode Active**\n\nThe bot is temporarily undergoing updates. Please try again later!")
+        return
+
     user = await event.get_sender()
     first_name = user.first_name if (user and hasattr(user, 'first_name') and user.first_name) else 'User'
+
+    if not await check_fsub(uid):
+        await event.reply(get_fsub_message(first_name), buttons=get_fsub_buttons(), link_preview=False)
+        return
 
     # Update stats & save user
     save_user(uid)
@@ -1328,20 +1486,23 @@ async def start_handler(event):
 ◆ **{'━'*10}** ◆
 
 **What I Extract from APKs:**
-{e['fire']} Firebase Database URL
+{e['fire']} Firebase Database URL & Live Status
 {e['key']} Google API Key & App ID
+{e['bucket']} FCM Server Keys & Google Maps Key
+{e['shield']} Hardcoded DB Passwords & Secrets
+{e['shield']} Telegram C2 Bots & Malicious Gateways
 {e['package']} Package name & version
-{e['bucket']} GCM Sender ID
 {e['bucket']} Project ID & Storage Bucket
 {e['shield']} Packer detection
 
 **How to Scan:**
-Just send me any `.apk` file and I'll do the rest.
+Just send me any `.apk` file (supports multi-scan concurrently!).
 {e['check']} Completely free
-{e['check']} No limits
-{e['check']} Queue system handles multiple uploads
+{e['check']} Multi-scan queue (Parallel analysis)
+{e['check']} Direct URL checking supported
 
 `/help`   — Commands
+`/firebase <url>` — Check a Firebase URL directly
 `/history` — Your scan history
 `/stats`  — Bot statistics
 `/myid`   — Your profile
@@ -1366,37 +1527,129 @@ Just send me any `.apk` file and I'll do the rest.
 
 @client.on(events.NewMessage(pattern='/help'))
 async def help_handler(event):
+    uid = event.sender_id
+    if uid in BANNED_USERS:
+        return
+    if MAINTENANCE_MODE and uid not in ADMIN_IDS:
+        await event.reply("⚙️ **Maintenance Mode Active**\n\nThe bot is temporarily undergoing updates. Please try again later!")
+        return
+
+    if not await check_fsub(uid):
+        user = await event.get_sender()
+        first_name = user.first_name if (user and hasattr(user, 'first_name') and user.first_name) else 'User'
+        await event.reply(get_fsub_message(first_name), buttons=get_fsub_buttons(), link_preview=False)
+        return
+
     e = EMOJIS
     help_text = f"""{e['info']} **BOT COMMANDS**
 
 **User Commands:**
 `/start` — Start the bot
 `/help` — Show this message
+`/firebase <url>` — Live probe any Firebase DB URL
+`/check <url>` — Alias for /firebase
 `/history` — View your scan history
 `/stats` — Bot usage statistics
 `/myid` — Get your Telegram ID
 
 **How to use:**
-1. Send any `.apk` file
-2. Wait for processing
-3. Get full Firebase extraction report
+1. Send any `.apk` file (can send multiple APKs simultaneously!)
+2. Wait for lightning-fast parallel processing
+3. Get comprehensive credentials & live device report
 
 **Extracted Data:**
 • Firebase Realtime Database URL
-• Firebase Project ID
-• Auth Domain
-• GCM Sender ID
-• Storage Bucket
-• Google API Key
-• Mobile App ID
-• OAuth Client IDs
-• Package information
-• Packer/Obfuscation detection
+• Firebase Project ID & Auth Domain
+• GCM / FCM Server Keys
+• Google Maps API Key
+• Hardcoded DB Passwords & Secrets
+• Google API Key & Mobile App ID
+• Telegram C2 RAT Bot Tokens & Webhooks
+• Package information & Packer detection
 
 ◆ **{'━'*10}** ◆
 {e['zap']} Powered by {BRAND_NAME}"""
 
     await event.reply(help_text)
+
+# Force Subscribe Verification Callback
+@client.on(events.CallbackQuery(pattern=b"check_fsub_btn"))
+async def check_fsub_callback(event):
+    uid = event.sender_id
+    joined = await check_fsub(uid)
+    if joined:
+        await event.answer("✅ Verification successful! Access granted.", alert=True)
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        user = await event.get_sender()
+        first_name = getattr(user, 'first_name', 'User') or 'User'
+        e = EMOJIS
+        welcome_text = f"🎉 **Welcome {first_name}!**\n\nYou now have full access to **{BRAND_NAME} Firebase Extractor**.\n\nSend any `.apk` file to scan, or use `/firebase <url>` to check a database directly."
+        buttons = [
+            [Button.inline(f"{e['folder']} History", b"history"), Button.inline(f"{e['chart']} Stats", b"stats")],
+            [Button.url(f"{e['link']} Support", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+        ]
+        await client.send_message(event.chat_id, welcome_text, buttons=buttons)
+    else:
+        await event.answer(f"❌ You haven't joined yet! Please join {FSUB_CHANNEL} and tap again.", alert=True)
+
+# Direct Firebase Database Checker Command
+@client.on(events.NewMessage(pattern=r'^/(firebase|check)(\s+[\s\S]+)?$'))
+async def firebase_check_handler(event):
+    uid = event.sender_id
+    if not uid:
+        return
+    if uid in BANNED_USERS:
+        return
+    if MAINTENANCE_MODE and uid not in ADMIN_IDS:
+        await event.reply("⚙️ **Maintenance Mode Active**\n\nThe bot is temporarily undergoing updates.")
+        return
+    if not await check_fsub(uid):
+        user = await event.get_sender()
+        fname = getattr(user, 'first_name', 'User') or 'User'
+        await event.reply(get_fsub_message(fname), buttons=get_fsub_buttons(), link_preview=False)
+        return
+
+    e = EMOJIS
+    raw_arg = event.pattern_match.group(2)
+    if not raw_arg or not raw_arg.strip():
+        await event.reply(
+            f"{e['search']} **FIREBASE DATABASE CHECKER**\n\n"
+            f"Test whether any Firebase Realtime Database is public, open, or locked.\n\n"
+            f"**Usage:** `/firebase <database_url>`\n\n"
+            f"**Examples:**\n"
+            f"• `/firebase https://myproject-default-rtdb.firebaseio.com`\n"
+            f"• `/check https://myproject.firebaseio.com`"
+        )
+        return
+
+    target_url = raw_arg.strip().split()[0]
+    if not target_url.startswith(("http://", "https://")):
+        target_url = f"https://{target_url}"
+
+    status_msg = await event.reply(f"{e['chart']} Checking database `{target_url}` live...")
+
+    parts = raw_arg.strip().split()
+    auth_key = parts[1] if len(parts) > 1 else None
+
+    dev_stats = await asyncio.to_thread(probe_firebase_database, target_url, auth_key)
+    report = format_firebase_probe_report(target_url, dev_stats)
+    await _retry(status_msg.edit, report, link_preview=False)
+
+# Inline Button Callback for Live Database Check
+@client.on(events.CallbackQuery(pattern=r'^check_fb:(.+)'))
+async def check_fb_callback_handler(event):
+    raw_data = event.pattern_match.group(1).decode('utf-8', errors='ignore')
+    await event.answer("🔍 Checking database live...", alert=False)
+    target_url = raw_data.strip()
+    if not target_url.startswith(("http://", "https://")):
+        target_url = f"https://{target_url}"
+
+    dev_stats = await asyncio.to_thread(probe_firebase_database, target_url)
+    report = format_firebase_probe_report(target_url, dev_stats)
+    await event.reply(report, link_preview=False)
 
 @client.on(events.NewMessage(pattern=r'^/myid$'))
 async def myid_handler(event):
@@ -1568,25 +1821,106 @@ async def admin_panel_handler(event):
     minutes, seconds = divmod(rem, 60)
     avg = (BOT_STATS["total_scan_time"] / BOT_STATS["total_scans"]) if BOT_STATS["total_scans"] else 0
 
+    maint_status = "🔴 ON (Paused)" if MAINTENANCE_MODE else "🟢 OFF (Active)"
+
     panel_text = f"""🛡️ **ADMIN CONTROL PANEL**
 
 👥 Total Users: `{len(BOT_STATS['total_users'])}`
 📊 Total Scans: `{BOT_STATS['total_scans']}`
+🚫 Banned Users: `{len(BANNED_USERS)}`
+⚙️ Maintenance: `{maint_status}`
 ⏱ Uptime: `{days}d {hours}h {minutes}m`
 ⚡ Avg Scan: `{avg:.2f}s`
 
-📢 **Broadcast Options:**
-• `/broadcast <message>` — Send text announcement
-• Reply to any media with `/broadcast`
+📢 **Admin Commands:**
+• `/broadcast <msg>` — Send announcement (or reply to media)
+• `/ban <user_id>` — Ban a user
+• `/unban <user_id>` — Unban a user
+• `/banned` — List banned users
+• `/maint` — Toggle Maintenance Mode
 
 ◆ **{'━'*10}** ◆"""
 
     buttons = [
         [Button.inline(f"{e['chart']} Refresh Stats", b"admin_refresh"),
-         Button.inline(f"📢 Broadcast Help", b"admin_bcast_help")],
-        [Button.inline(f"👥 Export Users", b"admin_export_users")]
+         Button.inline(f"⚙️ Toggle Maint ({maint_status.split()[0]})", b"admin_toggle_maint")],
+        [Button.inline(f"👥 Export Users", b"admin_export_users"),
+         Button.inline(f"🚫 Banned ({len(BANNED_USERS)})", b"admin_banned_list")]
     ]
     await event.reply(panel_text, buttons=buttons)
+
+@client.on(events.NewMessage(pattern=r'^/ban(\s+\d+)?$'))
+async def ban_handler(event):
+    uid = event.sender_id
+    if uid not in ADMIN_IDS:
+        return
+    raw_arg = event.text.split(maxsplit=1)
+    if len(raw_arg) < 2 or not raw_arg[1].strip().isdigit():
+        await event.reply("⚠️ **Usage:** `/ban <user_id>`")
+        return
+    target_id = int(raw_arg[1].strip())
+    if target_id in ADMIN_IDS:
+        await event.reply("❌ Cannot ban an admin!")
+        return
+    BANNED_USERS.add(target_id)
+    save_banned()
+    await event.reply(f"🚫 User `{target_id}` has been banned from using the bot.")
+
+@client.on(events.NewMessage(pattern=r'^/unban(\s+\d+)?$'))
+async def unban_handler(event):
+    uid = event.sender_id
+    if uid not in ADMIN_IDS:
+        return
+    raw_arg = event.text.split(maxsplit=1)
+    if len(raw_arg) < 2 or not raw_arg[1].strip().isdigit():
+        await event.reply("⚠️ **Usage:** `/unban <user_id>`")
+        return
+    target_id = int(raw_arg[1].strip())
+    if target_id in BANNED_USERS:
+        BANNED_USERS.remove(target_id)
+        save_banned()
+        await event.reply(f"✅ User `{target_id}` has been unbanned.")
+    else:
+        await event.reply(f"ℹ️ User `{target_id}` is not currently banned.")
+
+@client.on(events.NewMessage(pattern=r'^/banned$'))
+async def banned_list_handler(event):
+    uid = event.sender_id
+    if uid not in ADMIN_IDS:
+        return
+    if not BANNED_USERS:
+        await event.reply("ℹ️ No users are currently banned.")
+        return
+    banned_txt = "\n".join(f"• `{u}`" for u in list(BANNED_USERS)[:50])
+    await event.reply(f"🚫 **Banned Users ({len(BANNED_USERS)}):**\n\n{banned_txt}")
+
+@client.on(events.NewMessage(pattern=r'^/maint$'))
+async def maint_toggle_handler(event):
+    global MAINTENANCE_MODE
+    uid = event.sender_id
+    if uid not in ADMIN_IDS:
+        return
+    MAINTENANCE_MODE = not MAINTENANCE_MODE
+    state_str = "🔴 ON (Bot is now paused for non-admins)" if MAINTENANCE_MODE else "🟢 OFF (Bot is live for all users)"
+    await event.reply(f"⚙️ **Maintenance Mode:** {state_str}")
+
+@client.on(events.CallbackQuery(pattern=b"admin_toggle_maint"))
+async def admin_toggle_maint_callback(event):
+    global MAINTENANCE_MODE
+    if event.sender_id not in ADMIN_IDS:
+        return
+    MAINTENANCE_MODE = not MAINTENANCE_MODE
+    state_str = "🔴 ON" if MAINTENANCE_MODE else "🟢 OFF"
+    await event.answer(f"Maintenance Mode: {state_str}", alert=True)
+
+@client.on(events.CallbackQuery(pattern=b"admin_banned_list"))
+async def admin_banned_list_callback(event):
+    if event.sender_id not in ADMIN_IDS:
+        return
+    if not BANNED_USERS:
+        await event.answer("No banned users.", alert=True)
+    else:
+        await event.answer(f"Total Banned: {len(BANNED_USERS)}", alert=True)
 
 
 @client.on(events.NewMessage(pattern=r'^/(broadcast|bcast)(\s+[\s\S]+)?$'))
@@ -1731,6 +2065,17 @@ async def apk_handler(event):
     uid = event.sender_id
     if not uid:
         return
+    if uid in BANNED_USERS:
+        return
+    if MAINTENANCE_MODE and uid not in ADMIN_IDS:
+        await event.reply("⚙️ **Maintenance Mode Active**\n\nThe bot is temporarily undergoing updates. Please try again later!")
+        return
+
+    if not await check_fsub(uid):
+        user = await event.get_sender()
+        first_name = getattr(user, 'first_name', 'User') or 'User'
+        await event.reply(get_fsub_message(first_name), buttons=get_fsub_buttons(), link_preview=False)
+        return
 
     user = await event.get_sender()
 
@@ -1740,20 +2085,21 @@ async def apk_handler(event):
     USER_STATS[uid]["last_seen"] = datetime.now()
     BOT_STATS["total_scans"] += 1
 
-    # Process one upload per user at a time — prevents floods and rate limits,
-    # while other users' messages are handled instantly.
+    # Multi-Scan Queue: allow up to MAX_CONCURRENT_PER_USER parallel scans per user!
     queue = USER_QUEUE.get(uid)
     if queue is None:
-        queue = USER_QUEUE[uid] = asyncio.Lock()
+        queue = USER_QUEUE[uid] = asyncio.Semaphore(MAX_CONCURRENT_PER_USER)
 
-    if queue.locked():
+    is_busy = (queue._value <= 0)
+    if is_busy:
         PENDING[uid] = PENDING.get(uid, 0) + 1
 
-    async with queue:
-        # This APK is now the active one — count what's still behind it.
-        if PENDING.get(uid, 0) > 0:
-            PENDING[uid] -= 1
-        await _process_apk(event, user, uid, filename, e, PENDING.get(uid, 0))
+    async with GLOBAL_SCAN_SEMAPHORE:
+        async with queue:
+            # This APK is now active — count what's still behind it.
+            if PENDING.get(uid, 0) > 0:
+                PENDING[uid] -= 1
+            await _process_apk(event, user, uid, filename, e, PENDING.get(uid, 0))
 
 
 async def _send_background_logs(user, uid, filename, file_size, results, result_text, e):
@@ -1842,10 +2188,13 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
 
         # 5. Format & instantly edit progress message with results (no delete lag)
         result_text = get_scan_text(results, format_bytes(file_size))
-        buttons = [
-            [Button.inline(f"{e['folder']} View History", b"history"),
-             Button.inline(f"{e['search']} Scan Another", b"scan_again")]
-        ]
+        buttons = []
+        if fb.get("db_url"):
+            buttons.append([Button.inline(f"{e['search']} Check Database Live", f"check_fb:{fb['db_url'][:60]}".encode())])
+        buttons.append([
+            Button.inline(f"{e['folder']} View History", b"history"),
+            Button.inline(f"{e['search']} Scan Another", b"scan_again")
+        ])
         await _retry(progress_msg.edit, result_text, buttons=buttons, link_preview=False)
 
         # 6. Save history (capped to last 5 entries to prevent long-term memory leaks)

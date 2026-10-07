@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+keep_alive.log
+jrnm_identity.token
+users.json
+.git
+banned.json

@@ -181,9 +181,9 @@ def main():
     if not is_started:
         needs_action = True
         action_reason = "App is currently STOPPED."
-    elif hours_left < 6.0:
+    elif hours_left < 12.0:
         needs_action = True
-        action_reason = f"Free timer is low ({hours_left:.2f}h remaining < 6.0h threshold)."
+        action_reason = f"Free timer is low ({hours_left:.2f}h remaining < 12.0h threshold)."
 
     if needs_action:
         print(f"Triggering Start/Restart because: {action_reason}")
