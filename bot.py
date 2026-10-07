@@ -1415,40 +1415,19 @@ def get_scan_text(results, file_size="Unknown"):
 
     return "\n".join(lines)
 
-def get_progress_text(filename, step, queue_info=None):
-    """Show scanning progress"""
-    e = EMOJIS
-    steps = [
-        ("Initializing scanner", 1),
-        ("Downloading APK", 2),
-        ("Decompiling APK", 3),
-        ("Scanning resources", 4),
-        ("Extracting Firebase config", 5),
-        ("Finalizing results...", 6)
-    ]
-
-    lines = [
-        f"{e['gear']} **{'━'*10}** {e['gear']}",
-        f"{e['fire']} **FIREBASE EXTRACTOR** {e['fire']}",
-        f"{e['gear']} **{'━'*10}** {e['gear']}",
-        "",
-        f"{e['zap']} **Processing:** `{filename}`",
-        "",
-    ]
-
-    for i, (desc, num) in enumerate(steps, 1):
-        if i < step:
-            lines.append(f"{e['check']} {desc}")
-        elif i == step:
-            lines.append(f"{e['chart']} {desc}...")
-        else:
-            lines.append(f"⬜ {desc}")
-
-    lines.append("")
-    if queue_info:
-        lines.append(queue_info)
-    lines.append(f"━" * 20)
-    return "\n".join(lines)
+def render_progress_bar(pct: int, status_text: str, filename: str, queue_text: str = "") -> str:
+    """Renders a dynamic visual progress bar and status for scan processing."""
+    pct = max(0, min(100, int(pct)))
+    filled = int(pct / 10)
+    bar = f"[{'█' * filled}{'░' * (10 - filled)}] {pct}%"
+    return (
+        f"⚙️ <b>{BRAND_NAME} SCAN ENGINE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 <b>File:</b> <code>{filename}</code>{queue_text}\n"
+        f"<code>{bar}</code>\n\n"
+        f"⚡ <i>{status_text}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
 
 # ==================== HANDLERS ====================
 @client.on(events.NewMessage(pattern=r'^/start(\s+[\s\S]+)?$'))
@@ -2150,36 +2129,70 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
     t0 = time.monotonic()
     queue_text = f" | {e['timer']} Queue: `{pending}`" if pending > 0 else ""
 
-    # Instant progress notification (single message, no edit throttling)
+    last_edit = 0.0
+
+    async def _safe_edit_progress(pct: int, status_text: str, force: bool = False):
+        nonlocal last_edit
+        now = time.monotonic()
+        if not force and (now - last_edit < 1.3):
+            return
+        last_edit = now
+        text = render_progress_bar(pct, status_text, filename, queue_text)
+        try:
+            await progress_msg.edit(text, parse_mode='html', link_preview=False)
+        except Exception:
+            pass
+
+    # Instant progress notification with visual progress bar starting at 10%
+    initial_text = render_progress_bar(10, "Connecting & preparing download...", filename, queue_text)
     progress_msg = await _retry(
         event.reply,
-        f"{e['zap']} **Processing:** `{filename}`{queue_text}\n\n{e['chart']} Downloading & analyzing APK...",
+        initial_text,
+        parse_mode='html',
         link_preview=False
     )
+    last_edit = time.monotonic()
     tmp_dir = tempfile.mkdtemp()
     apk_path = os.path.join(tmp_dir, filename)
 
     try:
-        # 1. Download at maximum speed
-        downloaded = await event.download_media(file=apk_path)
+        # 1. Download with real-time dynamic progress callback (10% to 50%)
+        async def _download_cb(current, total):
+            if total and total > 0:
+                pct = 10 + int((current / total) * 40)
+                cur_str = format_bytes(current)
+                tot_str = format_bytes(total)
+                await _safe_edit_progress(pct, f"Downloading APK ({cur_str} / {tot_str})...")
+
+        downloaded = await event.download_media(file=apk_path, progress_callback=_download_cb)
         if not downloaded or not os.path.exists(apk_path) or os.path.getsize(apk_path) == 0:
             raise RuntimeError("Failed to download APK from Telegram. Please try sending the file again.")
         file_size = os.path.getsize(apk_path)
 
+        # 55%: Unpacking
+        await _safe_edit_progress(55, "Unpacking structures & AndroidManifest.xml...", force=True)
+
         # 2. Fast multi-pass / single-stream scan in thread
         scanner = APKScanner(apk_path)
+
+        # 70%: String pool & DEX scan
+        await _safe_edit_progress(70, "Scanning DEX string pools, resources & native libs...", force=True)
         results = await asyncio.to_thread(scanner.scan)
 
         # 3. Live probe Firebase database for device counts & access status
         fb = results.get("firebase", {})
         api = results.get("api_credentials", {})
         if fb.get("db_url"):
+            await _safe_edit_progress(88, "Live probing Firebase database endpoints...", force=True)
             dev_stats = await asyncio.to_thread(
                 probe_firebase_database,
                 fb["db_url"],
                 api.get("google_api_key")
             )
             results["device_stats"] = dev_stats
+
+        # 98%: Finalizing
+        await _safe_edit_progress(98, "Finalizing report & formatting results...", force=True)
 
         # 4. Total timing
         elapsed = time.monotonic() - t0
