@@ -162,7 +162,8 @@ async def check_fsub(uid):
     if not FSUB_CHANNEL:
         return True
     try:
-        await client(GetParticipantRequest(channel=FSUB_CHANNEL, user_id=uid))
+        channel_entity = await client.get_input_entity(FSUB_CHANNEL)
+        await client(GetParticipantRequest(channel=channel_entity, participant=uid))
         return True
     except UserNotParticipantError:
         return False
@@ -187,6 +188,7 @@ def get_fsub_message(first_name="User"):
 # Cache of completed scans keyed by APK sha1 — identical re-scans skip parsing.
 SCAN_CACHE = {}
 MAX_CACHE_ENTRIES = 20
+URL_CACHE = {}
 
 # Per-user lock so one user's many uploads are processed sequentially
 # (prevents floods/rate limits) while other users stay responsive.
@@ -1173,9 +1175,18 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    clean_url = db_url.rstrip("/")
-    if clean_url.endswith(".json"):
-        clean_url = clean_url[:-5]
+    # Canonical root host extraction & auto-extract auth param if embedded in URL
+    parsed = urllib.parse.urlparse(db_url if "://" in db_url else f"https://{db_url}")
+    host = parsed.netloc.lower() or parsed.path.lower().split("/")[0]
+    clean_url = f"https://{host}"
+
+    if not auth_key and parsed.query:
+        try:
+            qs = urllib.parse.parse_qs(parsed.query)
+            if "auth" in qs:
+                auth_key = qs["auth"][0]
+        except Exception:
+            pass
 
     results = {
         "status": "Unknown",
@@ -1187,7 +1198,8 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
     }
 
     def _get(path: str, use_auth: bool = False):
-        url = f"{clean_url}/{path}"
+        clean_path = path.lstrip("/")
+        url = f"{clean_url}/{clean_path}"
         if use_auth and auth_key:
             sep = "&" if "?" in url else "?"
             url += f"{sep}auth={auth_key}"
@@ -1230,9 +1242,77 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
                 offline += 1
         return online, offline, len(data_dict)
 
-    # 1. Probing device endpoints with shallow=true for ultra-fast response
-    device_endpoints = ["clients", "devices", "victim", "victims", "users", "data", "online", "bots", "phones", "all_pas"]
     auth_options = [False, True] if auth_key else [False]
+
+    # 1. Probe root shallow first (fastest single-request check for completely open databases)
+    for use_auth in auth_options:
+        try:
+            with _get(".json?shallow=true", use_auth=use_auth) as resp:
+                if resp.status == 200:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                    if raw and raw != "null":
+                        root_keys = json.loads(raw)
+                        if isinstance(root_keys, dict) and root_keys:
+                            results["accessible"] = True
+                            results["status"] = "🟢 Open (Accessible)" if not use_auth else "🔑 Auth Verified"
+                            results["nodes"] = list(root_keys.keys())[:8]
+
+                            # Check if known device endpoints exist at root
+                            dev_node = next((k for k in ["clients", "devices", "victim", "victims", "users", "bots", "phones", "all_pas", "data"] if k in root_keys), None)
+                            if dev_node:
+                                try:
+                                    with _get(f"{dev_node}.json?shallow=true", use_auth=use_auth) as dev_resp:
+                                        if dev_resp.status == 200:
+                                            dev_raw = dev_resp.read().decode("utf-8", errors="ignore")
+                                            if dev_raw and dev_raw != "null":
+                                                dev_dict = json.loads(dev_raw)
+                                                if isinstance(dev_dict, dict):
+                                                    results["total"] = len(dev_dict)
+                                                    results["offline"] = len(dev_dict)
+                                                    if len(dev_dict) <= 15:
+                                                        try:
+                                                            with _get(f"{dev_node}.json", use_auth=use_auth) as full_resp:
+                                                                full_data = json.loads(full_resp.read(262144).decode("utf-8", errors="ignore"))
+                                                                if isinstance(full_data, dict):
+                                                                    on, off, tot = _eval_devices(full_data)
+                                                                    results["online"] = on
+                                                                    results["offline"] = off
+                                                                    results["total"] = tot
+                                                        except Exception:
+                                                            pass
+                                except Exception:
+                                    pass
+                            elif any(re.match(r'^[a-fA-F0-9]{12,36}$', k) for k in list(root_keys.keys())[:5]):
+                                results["total"] = len(root_keys)
+                                results["offline"] = len(root_keys)
+                            return results
+                        elif root_keys == {}:
+                            results["accessible"] = True
+                            results["status"] = "🟢 Open (Empty Database)" if not use_auth else "🔑 Auth Verified (Empty)"
+                            return results
+        except urllib.error.HTTPError as he:
+            if he.code == 402:
+                results["status"] = "⚠️ Quota Exceeded (402 Payment Required)"
+                return results
+            elif he.code == 423:
+                results["status"] = "🔴 Deactivated / Suspended (423 Locked)"
+                return results
+            elif he.code in (401, 403):
+                results["status"] = "🔒 Protected (Auth Required)"
+            elif he.code != 404:
+                results["status"] = f"⚪ HTTP {he.code}"
+        except urllib.error.URLError:
+            results["status"] = "🔴 Unreachable (Host Not Found)"
+            return results
+        except Exception:
+            pass
+
+    # 2. Probe granular endpoints (Firebase rules often protect root but allow read on specific child endpoints)
+    custom_path = parsed.path.strip("/").rstrip(".json")
+    device_endpoints = ["clients", "devices", "victim", "victims", "users", "data", "online", "bots", "phones", "all_pas"]
+    if custom_path and custom_path not in device_endpoints:
+        device_endpoints.insert(0, custom_path)
+
     for ep in device_endpoints:
         for use_auth in auth_options:
             try:
@@ -1246,11 +1326,11 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
                                 results["status"] = "🟢 Open (Accessible)" if not use_auth else "🔑 Auth Verified"
                                 results["total"] = len(keys_dict)
                                 results["offline"] = len(keys_dict)
-                                # Fetch full endpoint to evaluate online vs offline ONLY if device count is small (<= 15) to prevent OOM
+                                results["nodes"] = [ep]
                                 if len(keys_dict) <= 15:
                                     try:
                                         with _get(f"{ep}.json", use_auth=use_auth) as full_resp:
-                                            raw_bytes = full_resp.read(262144)  # Max 256KB buffer
+                                            raw_bytes = full_resp.read(262144)
                                             full_data = json.loads(raw_bytes.decode("utf-8", errors="ignore"))
                                             if isinstance(full_data, dict):
                                                 on, off, tot = _eval_devices(full_data)
@@ -1260,6 +1340,12 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
                                     except Exception:
                                         pass
                                 return results
+                            elif isinstance(keys_dict, list) and keys_dict:
+                                results["accessible"] = True
+                                results["status"] = "🟢 Open (Accessible)" if not use_auth else "🔑 Auth Verified"
+                                results["total"] = len(keys_dict)
+                                results["nodes"] = [ep]
+                                return results
             except urllib.error.HTTPError as he:
                 if he.code == 402:
                     results["status"] = "⚠️ Quota Exceeded (402 Payment Required)"
@@ -1267,52 +1353,18 @@ def probe_firebase_database(db_url: str, auth_key: str = None, timeout: float = 
                 elif he.code == 423:
                     results["status"] = "🔴 Deactivated / Suspended (423 Locked)"
                     return results
-                elif he.code in (401, 403) and not use_auth and auth_key:
-                    continue
                 elif he.code in (401, 403):
-                    results["status"] = "🔒 Protected (Auth Required)"
-                    return results
-                elif he.code != 404:
-                    results["status"] = f"⚪ HTTP {he.code}"
-                    return results
+                    if results["status"] == "Unknown":
+                        results["status"] = "🔒 Protected (Auth Required)"
+                    continue
+                elif he.code == 404:
+                    continue
+                else:
+                    if results["status"] == "Unknown":
+                        results["status"] = f"⚪ HTTP {he.code}"
+                    continue
             except Exception:
                 pass
-
-    # 2. Probe root shallow if device endpoints were not present (404)
-    for use_auth in auth_options:
-        try:
-            with _get(".json?shallow=true", use_auth=use_auth) as resp:
-                if resp.status == 200:
-                    raw = resp.read().decode("utf-8", errors="ignore")
-                    if raw and raw != "null":
-                        root_keys = json.loads(raw)
-                        if isinstance(root_keys, dict) and root_keys:
-                            results["accessible"] = True
-                            results["nodes"] = list(root_keys.keys())[:6]
-                            sample_keys = list(root_keys.keys())
-                            if any(re.match(r'^[a-fA-F0-9]{12,36}$', k) for k in sample_keys[:5]):
-                                results["status"] = "🟢 Open (Accessible)" if not use_auth else "🔑 Auth Verified"
-                                results["total"] = len(root_keys)
-                                results["offline"] = len(root_keys)
-                            else:
-                                results["status"] = "🟢 Open (0 Devices / Inactive)" if not use_auth else "🔑 Auth Verified (Empty)"
-                            return results
-        except urllib.error.HTTPError as he:
-            if he.code == 402:
-                results["status"] = "⚠️ Quota Exceeded (402 Payment Required)"
-            elif he.code == 423:
-                results["status"] = "🔴 Deactivated / Suspended (423 Locked)"
-            elif he.code in (401, 403) and not use_auth and auth_key:
-                continue
-            elif he.code in (401, 403):
-                results["status"] = "🔒 Protected (Auth Required)"
-            elif he.code == 404:
-                results["status"] = "🔴 Not Found (404)"
-            else:
-                results["status"] = f"⚪ HTTP {he.code}"
-            return results
-        except Exception:
-            pass
 
     if results["status"] == "Unknown":
         results["status"] = "⚪ Inactive / Unreachable"
@@ -1604,14 +1656,14 @@ async def firebase_check_handler(event):
         )
         return
 
-    target_url = raw_arg.strip().split()[0]
+    target_url = raw_arg.strip().split()[0].strip("\"'`<>[]()")
     if not target_url.startswith(("http://", "https://")):
         target_url = f"https://{target_url}"
 
     status_msg = await event.reply(f"{e['chart']} Checking database `{target_url}` live...")
 
     parts = raw_arg.strip().split()
-    auth_key = parts[1] if len(parts) > 1 else None
+    auth_key = parts[1].strip("\"'`<>[]()") if len(parts) > 1 else None
 
     dev_stats = await asyncio.to_thread(probe_firebase_database, target_url, auth_key)
     report = format_firebase_probe_report(target_url, dev_stats)
@@ -1620,9 +1672,10 @@ async def firebase_check_handler(event):
 # Inline Button Callback for Live Database Check
 @client.on(events.CallbackQuery(pattern=r'^check_fb:(.+)'))
 async def check_fb_callback_handler(event):
-    raw_data = event.pattern_match.group(1).decode('utf-8', errors='ignore')
+    raw_data = event.pattern_match.group(1).decode('utf-8', errors='ignore').strip()
     await event.answer("🔍 Checking database live...", alert=False)
-    target_url = raw_data.strip()
+    target_url = URL_CACHE.get(raw_data) or raw_data
+    target_url = target_url.strip("\"'`<>[]()")
     if not target_url.startswith(("http://", "https://")):
         target_url = f"https://{target_url}"
 
@@ -1724,30 +1777,7 @@ async def callback_handler(event):
     elif data == "admin_refresh":
         if uid not in ADMIN_IDS:
             return
-        uptime = datetime.now() - BOT_STATS["start_time"]
-        days = uptime.days
-        hours, rem = divmod(uptime.seconds, 3600)
-        minutes, seconds = divmod(rem, 60)
-        avg = (BOT_STATS["total_scan_time"] / BOT_STATS["total_scans"]) if BOT_STATS["total_scans"] else 0
-
-        panel_text = f"""🛡️ **ADMIN CONTROL PANEL**
-
-👥 Total Users: `{len(BOT_STATS['total_users'])}`
-📊 Total Scans: `{BOT_STATS['total_scans']}`
-⏱ Uptime: `{days}d {hours}h {minutes}m`
-⚡ Avg Scan: `{avg:.2f}s`
-
-📢 **Broadcast Options:**
-• `/broadcast <message>` — Send text announcement
-• Reply to any media with `/broadcast`
-
-◆ **{'━'*10}** ◆"""
-
-        buttons = [
-            [Button.inline(f"{e['chart']} Refresh Stats", b"admin_refresh"),
-             Button.inline(f"📢 Broadcast Help", b"admin_bcast_help")],
-            [Button.inline(f"👥 Export Users", b"admin_export_users")]
-        ]
+        panel_text, buttons = build_admin_panel()
         await event.edit(panel_text, buttons=buttons)
 
     elif data == "admin_bcast_help":
@@ -1787,12 +1817,7 @@ Send a photo, video, document, or audio to this chat, then **reply** to that mes
             await event.reply("👥 No registered users found yet.")
 
 # ==================== ADMIN COMMANDS ====================
-@client.on(events.NewMessage(pattern=r'^/(admin|panel)'))
-async def admin_panel_handler(event):
-    uid = event.sender_id
-    if uid not in ADMIN_IDS:
-        return
-
+def build_admin_panel():
     e = EMOJIS
     uptime = datetime.now() - BOT_STATS["start_time"]
     days = uptime.days
@@ -1822,10 +1847,19 @@ async def admin_panel_handler(event):
 
     buttons = [
         [Button.inline(f"{e['chart']} Refresh Stats", b"admin_refresh"),
-         Button.inline(f"⚙️ Toggle Maint ({maint_status.split()[0]})", b"admin_toggle_maint")],
+         Button.inline(f"⚙️ Maint ({maint_status.split()[0]})", b"admin_toggle_maint")],
         [Button.inline(f"👥 Export Users", b"admin_export_users"),
-         Button.inline(f"🚫 Banned ({len(BANNED_USERS)})", b"admin_banned_list")]
+         Button.inline(f"🚫 Banned ({len(BANNED_USERS)})", b"admin_banned_list")],
+        [Button.inline("📢 Broadcast Help", b"admin_bcast_help")]
     ]
+    return panel_text, buttons
+
+@client.on(events.NewMessage(pattern=r'^/(admin|panel)'))
+async def admin_panel_handler(event):
+    uid = event.sender_id
+    if uid not in ADMIN_IDS:
+        return
+    panel_text, buttons = build_admin_panel()
     await event.reply(panel_text, buttons=buttons)
 
 @client.on(events.NewMessage(pattern=r'^/ban(\s+\d+)?$'))
@@ -1890,16 +1924,22 @@ async def admin_toggle_maint_callback(event):
         return
     MAINTENANCE_MODE = not MAINTENANCE_MODE
     state_str = "🔴 ON" if MAINTENANCE_MODE else "🟢 OFF"
-    await event.answer(f"Maintenance Mode: {state_str}", alert=True)
+    panel_text, buttons = build_admin_panel()
+    try:
+        await event.edit(panel_text, buttons=buttons)
+    except Exception:
+        pass
+    await event.answer(f"Maintenance Mode: {state_str}", alert=False)
 
 @client.on(events.CallbackQuery(pattern=b"admin_banned_list"))
 async def admin_banned_list_callback(event):
     if event.sender_id not in ADMIN_IDS:
         return
     if not BANNED_USERS:
-        await event.answer("No banned users.", alert=True)
+        await event.answer("ℹ️ No users are currently banned.", alert=True)
     else:
-        await event.answer(f"Total Banned: {len(BANNED_USERS)}", alert=True)
+        sample = ", ".join(str(u) for u in list(BANNED_USERS)[:15])
+        await event.answer(f"🚫 Total Banned ({len(BANNED_USERS)}):\n{sample}", alert=True)
 
 
 @client.on(events.NewMessage(pattern=r'^/(broadcast|bcast)(\s+[\s\S]+)?$'))
@@ -2069,16 +2109,28 @@ async def apk_handler(event):
     if queue is None:
         queue = USER_QUEUE[uid] = asyncio.Semaphore(MAX_CONCURRENT_PER_USER)
 
-    is_busy = (queue._value <= 0)
-    if is_busy:
+    is_queued = (queue._value <= 0) or (GLOBAL_SCAN_SEMAPHORE._value <= 0)
+    if is_queued:
         PENDING[uid] = PENDING.get(uid, 0) + 1
+        queue_pos = PENDING[uid]
+        status_txt = f"⏳ In Queue (waiting for worker slot #{queue_pos})..."
+        initial_text = render_progress_bar(3, status_txt, filename, f" | {e['timer']} Queue: `{queue_pos}`")
+    else:
+        initial_text = render_progress_bar(10, "Connecting & preparing download...", filename)
+
+    progress_msg = await _retry(
+        event.reply,
+        initial_text,
+        parse_mode='html',
+        link_preview=False
+    )
 
     async with GLOBAL_SCAN_SEMAPHORE:
         async with queue:
             # This APK is now active — count what's still behind it.
-            if PENDING.get(uid, 0) > 0:
+            if is_queued and PENDING.get(uid, 0) > 0:
                 PENDING[uid] -= 1
-            await _process_apk(event, user, uid, filename, e, PENDING.get(uid, 0))
+            await _process_apk(event, user, uid, filename, e, progress_msg, PENDING.get(uid, 0), was_queued=is_queued)
 
 
 async def _send_background_logs(user, uid, filename, file_size, results, result_text, e):
@@ -2125,7 +2177,7 @@ async def _send_background_logs(user, uid, filename, file_size, results, result_
         pass
 
 
-async def _process_apk(event, user, uid, filename, e, pending=0):
+async def _process_apk(event, user, uid, filename, e, progress_msg, pending=0, was_queued=False):
     t0 = time.monotonic()
     queue_text = f" | {e['timer']} Queue: `{pending}`" if pending > 0 else ""
 
@@ -2143,15 +2195,9 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
         except Exception:
             pass
 
-    # Instant progress notification with visual progress bar starting at 10%
-    initial_text = render_progress_bar(10, "Connecting & preparing download...", filename, queue_text)
-    progress_msg = await _retry(
-        event.reply,
-        initial_text,
-        parse_mode='html',
-        link_preview=False
-    )
-    last_edit = time.monotonic()
+    if was_queued:
+        await _safe_edit_progress(10, "Worker assigned! Connecting & preparing download...", force=True)
+
     tmp_dir = tempfile.mkdtemp()
     apk_path = os.path.join(tmp_dir, filename)
 
@@ -2203,7 +2249,13 @@ async def _process_apk(event, user, uid, filename, e, pending=0):
         result_text = get_scan_text(results, format_bytes(file_size))
         buttons = []
         if fb.get("db_url"):
-            buttons.append([Button.inline(f"{e['search']} Check Database Live", f"check_fb:{fb['db_url'][:60]}".encode())])
+            db_u = fb["db_url"]
+            db_id = hashlib.md5(db_u.encode()).hexdigest()[:10]
+            URL_CACHE[db_id] = db_u
+            if len(URL_CACHE) > 500:
+                for old_k in list(URL_CACHE.keys())[:200]:
+                    URL_CACHE.pop(old_k, None)
+            buttons.append([Button.inline(f"{e['search']} Check Database Live", f"check_fb:{db_id}".encode())])
         buttons.append([
             Button.inline(f"{e['folder']} View History", b"history"),
             Button.inline(f"{e['search']} Scan Another", b"scan_again")
