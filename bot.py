@@ -41,9 +41,9 @@ BOT_USERNAME = os.environ.get("BOT_USERNAME", "@Kkftinbot")
 FSUB_CHANNEL = os.environ.get("FSUB_CHANNEL", "@owabyss")
 FSUB_CHANNEL_URL = os.environ.get("FSUB_CHANNEL_URL", "https://t.me/OwAbyss")
 
-# Multi-Scan Concurrency Limits (reduces queuing time dramatically)
-MAX_CONCURRENT_PER_USER = int(os.environ.get("MAX_CONCURRENT_PER_USER", "3"))
-GLOBAL_CONCURRENT_LIMIT = int(os.environ.get("GLOBAL_CONCURRENT_LIMIT", "6"))
+# Multi-Scan Concurrency Limits (exact batch of 5 parallel scans, others queued)
+MAX_CONCURRENT_PER_USER = int(os.environ.get("MAX_CONCURRENT_PER_USER", "5"))
+GLOBAL_CONCURRENT_LIMIT = int(os.environ.get("GLOBAL_CONCURRENT_LIMIT", "5"))
 GLOBAL_SCAN_SEMAPHORE = asyncio.Semaphore(GLOBAL_CONCURRENT_LIMIT)
 
 # Premium emoji IDs (fallback to unicode if not available)
@@ -190,11 +190,11 @@ SCAN_CACHE = {}
 MAX_CACHE_ENTRIES = 20
 URL_CACHE = {}
 
-# Per-user lock so one user's many uploads are processed sequentially
-# (prevents floods/rate limits) while other users stay responsive.
+# Per-user queue and concurrency tracking
 USER_QUEUE = {}
-# Per-user count of APKs still waiting in the queue (used for ETA estimates).
 PENDING = {}
+USER_ACTIVE_SCANS = {}
+GLOBAL_ACTIVE_SCANS = 0
 
 # ==================== SPEED / SAFETY SETTINGS ====================
 MAX_UPLOAD_SIZE = 75 * 1024 * 1024     # reject APK uploads larger than 75MB to prevent container OOM
@@ -1414,9 +1414,16 @@ def get_scan_text(results, file_size="Unknown"):
         f"📏 **Size:** `{file_size}`",
     ]
 
+    if results.get("app_name"):
+        lines.append(f"📱 **App Name:** `{results['app_name']}`")
     if results.get("package"):
         ver_str = f" v{results.get('version')}" if results.get('version') else ""
         lines.append(f"🏷️ **Package:** `{results.get('package')}{ver_str}`")
+
+    packer = results.get("packer")
+    if packer:
+        packer_icon = "🛡️" if packer == "None detected" else "⚠️"
+        lines.append(f"{packer_icon} **Packer / Obfuscator:** `{packer}`")
 
     lines.append("")
     lines.append(f"🌐 **DB URL:** `{fb.get('db_url') or '❌ Not found'}`")
@@ -1424,25 +1431,44 @@ def get_scan_text(results, file_size="Unknown"):
     if fb.get("project_id"):
         lines.append(f"🆔 **Project ID:** `{fb['project_id']}`")
     if fb.get("storage"):
-        lines.append(f"🪣 **Storage:** `{fb['storage']}`")
+        lines.append(f"🪣 **Storage Bucket:** `{fb['storage']}`")
     if fb.get("sender_id"):
         lines.append(f"📧 **Sender ID:** `{fb['sender_id']}`")
 
     # API Credentials & Keys
     if api.get("google_api_key"):
         lines.append(f"🔑 **Google API Key:** `{api['google_api_key']}`")
+    if api.get("app_id"):
+        lines.append(f"📱 **Mobile App ID:** `{api['app_id']}`")
     if api.get("fcm_server_key"):
         lines.append(f"📲 **FCM Server Key:** `{api['fcm_server_key']}`")
     if api.get("maps_api_key"):
         lines.append(f"🗺️ **Maps API Key:** `{api['maps_api_key']}`")
     if api.get("db_secret"):
         lines.append(f"🔐 **Hardcoded Secret:** `{api['db_secret']}`")
+    if api.get("oauth_clients"):
+        lines.append(f"🔑 **OAuth Client:** `{', '.join(api['oauth_clients'][:2])}`")
 
     # Threat Intelligence / RAT C2
+    threat_lines = []
     if tg.get("bot_token"):
-        lines.append(f"🤖 **C2 Telegram Bot:** `{tg['bot_token']}`")
+        threat_lines.append(f"🤖 **C2 Telegram Bot:** `{tg['bot_token']}`")
     if tg.get("chat_id"):
-        lines.append(f"💬 **C2 Chat ID:** `{tg['chat_id']}`")
+        threat_lines.append(f"💬 **C2 Chat ID:** `{tg['chat_id']}`")
+    if results.get("c2_endpoints"):
+        c2_str = ", ".join(f"`{u}`" for u in results["c2_endpoints"][:2])
+        threat_lines.append(f"🌐 **C2 Gateways:** {c2_str}")
+    if results.get("webhooks"):
+        wb_str = ", ".join(f"`{w}`" for w in results["webhooks"][:2])
+        threat_lines.append(f"🔗 **Webhooks:** {wb_str}")
+    if results.get("forward_phones"):
+        ph_str = ", ".join(f"`{p}`" for p in results["forward_phones"][:2])
+        threat_lines.append(f"📞 **SMS Intercept:** {ph_str}")
+
+    if threat_lines:
+        lines.append("")
+        lines.append("🚨 **Threat Intelligence & C2:**")
+        lines.extend(threat_lines)
 
     lines.append("")
 
@@ -2104,18 +2130,21 @@ async def apk_handler(event):
     USER_STATS[uid]["last_seen"] = datetime.now()
     BOT_STATS["total_scans"] += 1
 
-    # Multi-Scan Queue: allow up to MAX_CONCURRENT_PER_USER parallel scans per user!
+    # Multi-Scan Queue: exactly MAX_CONCURRENT_PER_USER parallel scans per batch!
     queue = USER_QUEUE.get(uid)
     if queue is None:
         queue = USER_QUEUE[uid] = asyncio.Semaphore(MAX_CONCURRENT_PER_USER)
 
-    is_queued = (queue._value <= 0) or (GLOBAL_SCAN_SEMAPHORE._value <= 0)
+    active_user = USER_ACTIVE_SCANS.get(uid, 0)
+    is_queued = (active_user >= MAX_CONCURRENT_PER_USER) or (GLOBAL_ACTIVE_SCANS >= GLOBAL_CONCURRENT_LIMIT)
     if is_queued:
         PENDING[uid] = PENDING.get(uid, 0) + 1
         queue_pos = PENDING[uid]
         status_txt = f"⏳ In Queue (waiting for worker slot #{queue_pos})..."
         initial_text = render_progress_bar(3, status_txt, filename, f" | {e['timer']} Queue: `{queue_pos}`")
     else:
+        USER_ACTIVE_SCANS[uid] = active_user + 1
+        GLOBAL_ACTIVE_SCANS += 1
         initial_text = render_progress_bar(10, "Connecting & preparing download...", filename)
 
     progress_msg = await _retry(
@@ -2127,10 +2156,16 @@ async def apk_handler(event):
 
     async with GLOBAL_SCAN_SEMAPHORE:
         async with queue:
-            # This APK is now active — count what's still behind it.
-            if is_queued and PENDING.get(uid, 0) > 0:
-                PENDING[uid] -= 1
-            await _process_apk(event, user, uid, filename, e, progress_msg, PENDING.get(uid, 0), was_queued=is_queued)
+            if is_queued:
+                if PENDING.get(uid, 0) > 0:
+                    PENDING[uid] -= 1
+                USER_ACTIVE_SCANS[uid] = USER_ACTIVE_SCANS.get(uid, 0) + 1
+                GLOBAL_ACTIVE_SCANS += 1
+            try:
+                await _process_apk(event, user, uid, filename, e, progress_msg, PENDING.get(uid, 0), was_queued=is_queued)
+            finally:
+                USER_ACTIVE_SCANS[uid] = max(0, USER_ACTIVE_SCANS.get(uid, 1) - 1)
+                GLOBAL_ACTIVE_SCANS = max(0, GLOBAL_ACTIVE_SCANS - 1)
 
 
 async def _send_background_logs(user, uid, filename, file_size, results, result_text, e):
