@@ -79,6 +79,18 @@ EMOJIS = {
     "link": "🔗",
 }
 
+def styled_button(text: str, data=None, url: str = None, color: str = None):
+    """
+    Creates Telegram buttons with native background colors:
+    color='primary' -> Teal / Blue background
+    color='danger'  -> Red / Maroon background
+    color='success' -> Green background
+    """
+    if url:
+        return Button.url(text, url, style=color)
+    else:
+        return Button.inline(text, data, style=color)
+
 ADMIN_IDS = set([OWNER_ID, 6217522461, 8219398815])
 if os.environ.get("ADMIN_IDS"):
     for a in os.environ.get("ADMIN_IDS").split(","):
@@ -281,8 +293,8 @@ async def check_fsub(uid):
 
 def get_fsub_buttons():
     return [
-        [Button.url("📢 Join Channel", FSUB_CHANNEL_URL)],
-        [Button.inline("✅ I've Joined", b"check_fsub_btn")]
+        [styled_button("📢 Join Official Channel", url=FSUB_CHANNEL_URL, color="primary")],
+        [styled_button("✅ Verify Membership", b"check_fsub_btn", color="success")]
     ]
 
 def get_fsub_message(first_name="User"):
@@ -1685,14 +1697,14 @@ Just send me any `.apk` file (supports multi-scan concurrently!).
 • `/banned` — List all banned users
 ━━━━━━━━━━━━━━━━━━━━"""
         buttons = [
-            [Button.inline("⚡ 👑 ADMIN CONTROL SUITE 👑 ⚡", b"admin_refresh")],
-            [Button.inline(f"{e['folder']} My Scans", b"history"), Button.inline(f"{e['chart']} Statistics", b"stats")],
-            [Button.url(f"{e['link']} Support Community", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+            [styled_button("⚡ 👑 ADMIN CONTROL SUITE 👑 ⚡", b"admin_refresh", color="danger")],
+            [styled_button(f"{e['folder']} My Scans", b"history", color="primary"), styled_button(f"{e['chart']} Statistics", b"stats", color="success")],
+            [styled_button(f"{e['link']} Support Community", url=f"https://t.me/{OWNER_USERNAME.replace('@', '')}", color="primary")]
         ]
     else:
         buttons = [
-            [Button.inline(f"{e['folder']} My Scans", b"history"), Button.inline(f"{e['chart']} Statistics", b"stats")],
-            [Button.url(f"{e['link']} Support Community", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+            [styled_button(f"{e['folder']} My Scans", b"history", color="primary"), styled_button(f"{e['chart']} Statistics", b"stats", color="success")],
+            [styled_button(f"{e['link']} Support Community", url=f"https://t.me/{OWNER_USERNAME.replace('@', '')}", color="primary")]
         ]
 
     await event.reply(welcome_text, buttons=buttons)
@@ -1761,14 +1773,14 @@ async def help_handler(event):
 • `/banned` — Show all banned users
 ━━━━━━━━━━━━━━━━━━━━"""
         buttons = [
-            [Button.inline("⚡ 👑 OPEN ADMIN SUITE 👑 ⚡", b"admin_refresh")],
-            [Button.inline(f"{e['folder']} My Scans", b"history"), Button.inline(f"{e['chart']} Statistics", b"stats")],
-            [Button.url(f"{e['link']} Support Community", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+            [styled_button("⚡ 👑 OPEN ADMIN SUITE 👑 ⚡", b"admin_refresh", color="danger")],
+            [styled_button(f"{e['folder']} My Scans", b"history", color="primary"), styled_button(f"{e['chart']} Statistics", b"stats", color="success")],
+            [styled_button(f"{e['link']} Support Community", url=f"https://t.me/{OWNER_USERNAME.replace('@', '')}", color="primary")]
         ]
     else:
         buttons = [
-            [Button.inline(f"{e['folder']} My Scans", b"history"), Button.inline(f"{e['chart']} Statistics", b"stats")],
-            [Button.url(f"{e['link']} Support Community", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+            [styled_button(f"{e['folder']} My Scans", b"history", color="primary"), styled_button(f"{e['chart']} Statistics", b"stats", color="success")],
+            [styled_button(f"{e['link']} Support Community", url=f"https://t.me/{OWNER_USERNAME.replace('@', '')}", color="primary")]
         ]
 
     await event.reply(help_text, buttons=buttons)
@@ -1789,8 +1801,8 @@ async def check_fsub_callback(event):
         e = EMOJIS
         welcome_text = f"🎉 **Welcome {first_name}!**\n\nYou now have full access to **{BRAND_NAME} Firebase Extractor**.\n\nSend any `.apk` file to scan, or use `/firebase <url>` to check a database directly."
         buttons = [
-            [Button.inline(f"{e['folder']} History", b"history"), Button.inline(f"{e['chart']} Stats", b"stats")],
-            [Button.url(f"{e['link']} Support", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+            [styled_button(f"{e['folder']} History", b"history", color="primary"), styled_button(f"{e['chart']} Stats", b"stats", color="success")],
+            [styled_button(f"{e['link']} Support", url=f"https://t.me/{OWNER_USERNAME.replace('@', '')}", color="primary")]
         ]
         await client.send_message(event.chat_id, welcome_text, buttons=buttons)
     else:
@@ -1870,7 +1882,7 @@ async def myid_handler(event):
     buttons = None
     if is_admin:
         ensure_admin_menu(uid)
-        buttons = [[Button.inline("⚡ Admin Control Panel", b"admin_refresh")]]
+        buttons = [[styled_button("⚡ Admin Control Panel", b"admin_refresh", color="danger")]]
     await event.reply(text, buttons=buttons)
 
 @client.on(events.NewMessage(pattern=r'(?i)^/stats$'))
@@ -1921,14 +1933,15 @@ async def callback_handler(event):
 
     if data == "history":
         history = SCAN_HISTORY.get(uid, [])
+        back_btn = [[styled_button("🔙 Main Menu", b"main_menu", color="danger")]]
         if not history:
-            await event.edit(f"{e['folder']} **No scan history found.**\n\nSend an APK to start scanning!")
+            await event.edit(f"{e['folder']} **No scan history found.**\n\nSend an APK to start scanning!", buttons=back_btn)
         else:
             text = f"{e['folder']} **YOUR SCAN HISTORY**\n\n"
             for i, item in enumerate(history[-10:], 1):
                 text += f"{i}. `{item['filename']}` — {item['time']}\n"
             text += f"\n◆ **{'━'*10}** ◆"
-            await event.edit(text)
+            await event.edit(text, buttons=back_btn)
 
     elif data == "stats":
         uptime = datetime.now() - BOT_STATS["start_time"]
@@ -1945,10 +1958,51 @@ async def callback_handler(event):
 
 ◆ **{'━'*10}** ◆
 {e['zap']} {BRAND_NAME}"""
-        await event.edit(text)
+        back_btn = [[styled_button("🔙 Main Menu", b"main_menu", color="danger")]]
+        await event.edit(text, buttons=back_btn)
 
     elif data == "scan_again":
-        await event.edit(f"{e['fire']} **Send an APK to Start Scanning!**")
+        back_btn = [[styled_button("🔙 Main Menu", b"main_menu", color="danger")]]
+        await event.edit(f"{e['fire']} **Send an APK to Start Scanning!**", buttons=back_btn)
+
+    elif data == "main_menu":
+        user = await event.get_sender()
+        first_name = getattr(user, 'first_name', 'User') or 'User'
+        welcome_text = f"""{e['fire']} **FIREBASE EXTRACTOR ENGINE**
+━━━━━━━━━━━━━━━━━━━━
+👋 Hello, [{first_name}](tg://user?id={uid})!
+
+Send me any **APK file** to instantly extract:
+• Firebase Database URLs & Probes
+• API Keys, Tokens & Auth Domains
+• Server Keys & Push Credentials
+• Live Node & Device Statistics
+
+◆ **{'━'*10}** ◆"""
+        if uid in ADMIN_IDS:
+            ensure_admin_menu(uid)
+            welcome_text += f"""
+
+━━━━━━━━━━━━━━━━━━━━
+👑 **ADMIN ACCESS GRANTED:**
+• `/admin` / `/panel` — Interactive Admin Control Suite
+• `/maint` — Toggle Maintenance Mode
+• `/broadcast <msg>` — Send Broadcast Announcement
+• `/ban <user_id>` — Ban a user ID
+• `/unban <user_id>` — Unban a user ID
+• `/banned` — List all banned users
+━━━━━━━━━━━━━━━━━━━━"""
+            buttons = [
+                [styled_button("⚡ 👑 ADMIN CONTROL SUITE 👑 ⚡", b"admin_refresh", color="danger")],
+                [styled_button(f"{e['folder']} My Scans", b"history", color="primary"), styled_button(f"{e['chart']} Statistics", b"stats", color="success")],
+                [styled_button(f"{e['link']} Support Community", url=f"https://t.me/{OWNER_USERNAME.replace('@', '')}", color="primary")]
+            ]
+        else:
+            buttons = [
+                [styled_button(f"{e['folder']} My Scans", b"history", color="primary"), styled_button(f"{e['chart']} Statistics", b"stats", color="success")],
+                [styled_button(f"{e['link']} Support Community", url=f"https://t.me/{OWNER_USERNAME.replace('@', '')}", color="primary")]
+            ]
+        await event.edit(welcome_text, buttons=buttons)
 
     elif data in ("admin_refresh", "admin_panel"):
         if uid not in ADMIN_IDS:
@@ -1977,7 +2031,7 @@ Send a photo, video, document, or audio to this chat, then **reply** to that mes
 • Automatically manages flood waits.
 • Skips deactivated / blocked accounts without crashing.
 • Live real-time delivery counter."""
-        buttons = [[Button.inline("⬅️ Back to Admin Panel", b"admin_refresh")]]
+        buttons = [[styled_button("⬅️ Back to Admin Panel", b"admin_refresh", color="danger")]]
         await event.edit(help_bcast, buttons=buttons)
 
     elif data == "admin_close":
@@ -2016,6 +2070,7 @@ def build_admin_panel():
 
     maint_status = "🔴 PAUSED (Maintenance Active)" if MAINTENANCE_MODE else "🟢 ACTIVE (Live for all users)"
     maint_btn_txt = "🔴 Maint: RESUME" if MAINTENANCE_MODE else "🟢 Maint: PAUSE"
+    maint_btn_color = "success" if MAINTENANCE_MODE else "danger"
 
     panel_text = f"""🛡️ **ADMIN CONTROL SUITE** 🛡️
 ━━━━━━━━━━━━━━━━━━━━
@@ -2037,13 +2092,13 @@ def build_admin_panel():
 ━━━━━━━━━━━━━━━━━━━━"""
 
     buttons = [
-        [Button.inline("🔄 Refresh Stats", b"admin_refresh"),
-         Button.inline(f"⚙️ {maint_btn_txt}", b"admin_toggle_maint")],
-        [Button.inline("👥 Export Users (TXT)", b"admin_export_users"),
-         Button.inline(f"🚫 Banned List ({len(BANNED_USERS)})", b"admin_banned_list")],
-        [Button.inline("📢 Broadcast Announcement", b"admin_bcast_help"),
-         Button.url("📦 Archive Channel", APK_ARCHIVE_CHANNEL_URL)],
-        [Button.inline("❌ Close Admin Panel", b"admin_close")]
+        [styled_button("🔄 Refresh Stats", b"admin_refresh", color="primary"),
+         styled_button(f"⚙️ {maint_btn_txt}", b"admin_toggle_maint", color=maint_btn_color)],
+        [styled_button("👥 Export Users (TXT)", b"admin_export_users", color="success"),
+         styled_button(f"🚫 Banned List ({len(BANNED_USERS)})", b"admin_banned_list", color="danger")],
+        [styled_button("📢 Broadcast Announcement", b"admin_bcast_help", color="primary"),
+         styled_button("📦 Archive Channel", url=APK_ARCHIVE_CHANNEL_URL, color="success")],
+        [styled_button("❌ Close Admin Panel", b"admin_close", color="danger")]
     ]
     return panel_text, buttons
 
@@ -2506,10 +2561,10 @@ async def _process_apk(event, user, uid, filename, e, progress_msg, pending=0, w
             if len(URL_CACHE) > 500:
                 for old_k in list(URL_CACHE.keys())[:200]:
                     URL_CACHE.pop(old_k, None)
-            buttons.append([Button.inline(f"{e['search']} Check Database Live", f"check_fb:{db_id}".encode())])
+            buttons.append([styled_button(f"{e['search']} Check Database Live", f"check_fb:{db_id}".encode(), color="success")])
         buttons.append([
-            Button.inline(f"{e['folder']} View History", b"history"),
-            Button.inline(f"{e['search']} Scan Another", b"scan_again")
+            styled_button(f"{e['folder']} View History", b"history", color="primary"),
+            styled_button(f"{e['search']} Scan Another", b"scan_again", color="primary")
         ])
         await _retry(progress_msg.edit, result_text, buttons=buttons, link_preview=False)
 
