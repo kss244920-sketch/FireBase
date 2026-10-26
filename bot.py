@@ -203,14 +203,51 @@ _user_last_warn_ts = {}
 RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", "1.0"))
 RATE_LIMIT_ENABLED = True
 
+# ─── Atomic Event Deduplicator across Telethon & Bot API ───
+PROCESSED_EVENT_KEYS = {}
+
+def claim_event(key: str) -> bool:
+    """
+    Atomic event deduplicator across Telethon MTProto and Bot API Poller.
+    Returns True if this is the first time seeing this event.
+    Returns False if already claimed or in-flight.
+    """
+    if not key:
+        return True
+    now = time.time()
+    # Prune keys older than 10 minutes
+    if len(PROCESSED_EVENT_KEYS) > 3000:
+        cutoff = now - 600
+        for k in list(PROCESSED_EVENT_KEYS.keys()):
+            if PROCESSED_EVENT_KEYS[k] < cutoff:
+                PROCESSED_EVENT_KEYS.pop(k, None)
+    if key in PROCESSED_EVENT_KEYS:
+        return False
+    PROCESSED_EVENT_KEYS[key] = now
+    return True
+
 async def telecore_guard(event) -> bool:
     """
-    TeleCore Sliding Window Anti-Flood & Maintenance Mode Guard.
+    TeleCore Sliding Window Anti-Flood & Maintenance Mode Guard with Atomic Deduplication.
     Returns True if allowed to proceed, False otherwise.
     """
     uid = getattr(event, "sender_id", None)
     if not uid:
         return False
+
+    # 0. Atomic Deduplication check between Telethon MTProto and Bot API Poller
+    if isinstance(event, events.CallbackQuery.Event):
+        cb_data = getattr(event, "data", b"")
+        cb_data_str = cb_data.decode('utf-8', 'ignore') if isinstance(cb_data, bytes) else str(cb_data)
+        cb_key = f"cb:{uid}:{getattr(event, 'message_id', None)}:{cb_data_str}"
+        if not claim_event(cb_key):
+            return False
+    elif isinstance(event, events.NewMessage.Event):
+        chat_id = getattr(event, "chat_id", None)
+        msg_id = getattr(event, "id", None)
+        if chat_id and msg_id:
+            if not claim_event(f"msg:{chat_id}:{msg_id}"):
+                return False
 
     is_admin = (uid in ADMIN_IDS) or (uid == OWNER_ID)
     now = time.time()
@@ -1788,6 +1825,8 @@ async def help_handler(event):
 # Force Subscribe Verification Callback
 @client.on(events.CallbackQuery(pattern=b"check_fsub_btn"))
 async def check_fsub_callback(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
     joined = await check_fsub(uid)
     if joined:
@@ -1851,6 +1890,8 @@ async def firebase_check_handler(event):
 # Inline Button Callback for Live Database Check
 @client.on(events.CallbackQuery(pattern=r'^check_fb:(.+)'))
 async def check_fb_callback_handler(event):
+    if not await telecore_guard(event):
+        return
     raw_data = event.pattern_match.group(1).decode('utf-8', errors='ignore').strip()
     await event.answer("🔍 Checking database live...", alert=False)
     target_url = URL_CACHE.get(raw_data) or raw_data
@@ -1864,6 +1905,8 @@ async def check_fb_callback_handler(event):
 
 @client.on(events.NewMessage(pattern=r'(?i)^/myid$'))
 async def myid_handler(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
     user = await event.get_sender()
     e = EMOJIS
@@ -1887,6 +1930,8 @@ async def myid_handler(event):
 
 @client.on(events.NewMessage(pattern=r'(?i)^/stats$'))
 async def stats_handler(event):
+    if not await telecore_guard(event):
+        return
     e = EMOJIS
     uptime = datetime.now() - BOT_STATS["start_time"]
     days = uptime.days
@@ -1908,6 +1953,8 @@ async def stats_handler(event):
 
 @client.on(events.NewMessage(pattern=r'(?i)^/history$'))
 async def history_handler(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
     e = EMOJIS
     history = SCAN_HISTORY.get(uid, [])
@@ -2104,6 +2151,8 @@ def build_admin_panel():
 
 @client.on(events.NewMessage(pattern=r'(?i)^/(admin|panel)($|\s+)'))
 async def admin_panel_handler(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
     if uid not in ADMIN_IDS:
         await event.reply(f"❌ **Access Denied.**\n\nYour Telegram ID: `{uid}`\nYou do not have administrator permissions.")
@@ -2114,6 +2163,8 @@ async def admin_panel_handler(event):
 
 @client.on(events.NewMessage(pattern=r'(?i)^/ban(\s+\d+)?$'))
 async def ban_handler(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
     if uid not in ADMIN_IDS:
         await event.reply(f"❌ **Access Denied.** Your Telegram ID: `{uid}`")
@@ -2132,6 +2183,8 @@ async def ban_handler(event):
 
 @client.on(events.NewMessage(pattern=r'(?i)^/unban(\s+\d+)?$'))
 async def unban_handler(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
     if uid not in ADMIN_IDS:
         await event.reply(f"❌ **Access Denied.** Your Telegram ID: `{uid}`")
@@ -2150,6 +2203,8 @@ async def unban_handler(event):
 
 @client.on(events.NewMessage(pattern=r'(?i)^/banned$'))
 async def banned_list_handler(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
     if uid not in ADMIN_IDS:
         await event.reply(f"❌ **Access Denied.** Your Telegram ID: `{uid}`")
@@ -2162,6 +2217,8 @@ async def banned_list_handler(event):
 
 @client.on(events.NewMessage(pattern=r'(?i)^/maint$'))
 async def maint_toggle_handler(event):
+    if not await telecore_guard(event):
+        return
     global MAINTENANCE_MODE
     uid = event.sender_id
     if uid not in ADMIN_IDS:
@@ -2173,6 +2230,8 @@ async def maint_toggle_handler(event):
 
 @client.on(events.CallbackQuery(pattern=b"admin_toggle_maint"))
 async def admin_toggle_maint_callback(event):
+    if not await telecore_guard(event):
+        return
     global MAINTENANCE_MODE
     if event.sender_id not in ADMIN_IDS:
         return
@@ -2187,6 +2246,8 @@ async def admin_toggle_maint_callback(event):
 
 @client.on(events.CallbackQuery(pattern=b"admin_banned_list"))
 async def admin_banned_list_callback(event):
+    if not await telecore_guard(event):
+        return
     if event.sender_id not in ADMIN_IDS:
         return
     if not BANNED_USERS:
@@ -2198,6 +2259,8 @@ async def admin_banned_list_callback(event):
 
 @client.on(events.NewMessage(pattern=r'(?i)^/(broadcast|bcast)(\s+[\s\S]+)?$'))
 async def broadcast_handler(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
     if uid not in ADMIN_IDS:
         await event.reply(f"❌ **Access Denied.** Your Telegram ID: `{uid}`")
@@ -2699,7 +2762,12 @@ async def _handle_raw_update(upd: dict):
             chat_id = msg.get("chat", {}).get("id")
             from_user = msg.get("from", {})
             uid = from_user.get("id")
-            if not uid or not chat_id:
+            msg_id = msg.get("message_id")
+            if not uid or not chat_id or not msg_id:
+                return
+
+            # Atomic deduplication check
+            if not claim_event(f"msg:{chat_id}:{msg_id}"):
                 return
 
             is_admin = (uid in ADMIN_IDS) or (uid == OWNER_ID)
@@ -2713,7 +2781,12 @@ async def _handle_raw_update(upd: dict):
                 filename = doc.get("file_name", "application.apk")
                 file_size = doc.get("file_size", 0)
                 mime_type = doc.get("mime_type", "")
-                msg_id = msg.get("message_id")
+
+                # If file > 20MB, Bot API getFile cannot download it. Delegate to Telethon MTProto.
+                if file_size > 20 * 1024 * 1024:
+                    PROCESSED_EVENT_KEYS.pop(f"msg:{chat_id}:{msg_id}", None)
+                    print(f"[{BRAND_NAME}] Large file {filename} ({format_bytes(file_size)}) > 20MB: Delegated to Telethon MTProto engine.", flush=True)
+                    return
 
                 is_apk = filename.lower().endswith(('.apk', '.xapk', '.apks', '.zip', '.bin')) or mime_type == 'application/vnd.android.package-archive'
                 if not is_apk:
@@ -2951,6 +3024,11 @@ Just send me any `.apk` file (supports multi-scan concurrently!).
             from_user = cb.get("from", {})
             uid = from_user.get("id")
             is_admin = (uid in ADMIN_IDS) or (uid == OWNER_ID)
+
+            # Atomic deduplication check
+            cb_key = f"cb:{uid}:{msg_id}:{cb_data}"
+            if not claim_event(cb_key):
+                return
 
             if cb_data.startswith("check_fb:"):
                 db_id = cb_data.split(":", 1)[1]
