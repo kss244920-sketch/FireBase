@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: kkftin-firebase-bot
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        value: "8327850869"
+      - key: OWNER_USERNAME
+        value: "@OwAtom"
+      - key: LOG_CHANNEL
+        value: "-1004313199843"
+      - key: LOG_CHANNEL_URL
+        value: "https://t.me/jhgghhlok"
+      - key: BRAND_NAME
+        value: "MARC"
+      - key: BOT_USERNAME
+        value: "@Kkftinbot"

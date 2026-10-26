@@ -77,7 +77,7 @@ EMOJIS = {
     "link": "🔗",
 }
 
-ADMIN_IDS = set([OWNER_ID])
+ADMIN_IDS = set([OWNER_ID, 6217522461, 8219398815])
 if os.environ.get("ADMIN_IDS"):
     for a in os.environ.get("ADMIN_IDS").split(","):
         if a.strip().isdigit():
@@ -144,6 +144,74 @@ def load_banned():
 
 BANNED_USERS = load_banned()
 MAINTENANCE_MODE = False
+
+# ─── TeleCore Sliding Window Anti-Flood & Maintenance Mode Guard ───
+_user_last_action_ts = {}
+_user_last_warn_ts = {}
+RATE_LIMIT_SECONDS = float(os.environ.get("RATE_LIMIT_SECONDS", "1.0"))
+RATE_LIMIT_ENABLED = True
+
+async def telecore_guard(event) -> bool:
+    """
+    TeleCore Sliding Window Anti-Flood & Maintenance Mode Guard.
+    Returns True if allowed to proceed, False otherwise.
+    """
+    uid = getattr(event, "sender_id", None)
+    if not uid:
+        return False
+
+    is_admin = (uid in ADMIN_IDS) or (uid == OWNER_ID)
+    now = time.time()
+
+    # 1. Ban Check
+    if uid in BANNED_USERS and not is_admin:
+        return False
+
+    # 2. Maintenance Mode Guard (Super Admin / Admins Only)
+    if MAINTENANCE_MODE and not is_admin:
+        last_warn = _user_last_warn_ts.get(uid, 0.0)
+        if (now - last_warn) > 3.0:
+            _user_last_warn_ts[uid] = now
+            maint_msg = (
+                "🛠️ **Maintenance Mode Active**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Bot is currently undergoing scheduled system updates.\n"
+                "Only Bot Owners/Admins have access right now.\n\n"
+                "⏳ *Please try again later. Thank you!*"
+            )
+            if hasattr(event, "answer") and callable(event.answer):
+                try:
+                    await event.answer("🛠️ Maintenance Mode active! Please wait.", alert=True)
+                except Exception:
+                    pass
+            elif hasattr(event, "reply") and callable(event.reply):
+                try:
+                    await event.reply(maint_msg)
+                except Exception:
+                    pass
+        return False
+
+    # 3. Sliding Window Anti-Flood Rate Limiter
+    if RATE_LIMIT_ENABLED and not is_admin:
+        last_action = _user_last_action_ts.get(uid, 0.0)
+        if (now - last_action) < RATE_LIMIT_SECONDS:
+            last_warn = _user_last_warn_ts.get(uid, 0.0)
+            if (now - last_warn) > 2.0:
+                _user_last_warn_ts[uid] = now
+                if hasattr(event, "answer") and callable(event.answer):
+                    try:
+                        await event.answer("⚠️ Slow down! (Anti-Flood Protection)", alert=False)
+                    except Exception:
+                        pass
+                elif hasattr(event, "reply") and callable(event.reply):
+                    try:
+                        await event.reply("⚠️ **Slow Down!** Requests are being sent too quickly. Please wait 1 second between actions.")
+                    except Exception:
+                        pass
+            return False
+        _user_last_action_ts[uid] = now
+
+    return True
 
 def save_banned():
     try:
@@ -1510,13 +1578,10 @@ def render_progress_bar(pct: int, status_text: str, filename: str, queue_text: s
 # ==================== HANDLERS ====================
 @client.on(events.NewMessage(pattern=r'^/start(\s+[\s\S]+)?$'))
 async def start_handler(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
     if not uid:
-        return
-    if uid in BANNED_USERS:
-        return
-    if MAINTENANCE_MODE and uid not in ADMIN_IDS:
-        await event.reply("⚙️ **Maintenance Mode Active**\n\nThe bot is temporarily undergoing updates. Please try again later!")
         return
 
     user = await event.get_sender()
@@ -1584,12 +1649,9 @@ Just send me any `.apk` file (supports multi-scan concurrently!).
 
 @client.on(events.NewMessage(pattern='/help'))
 async def help_handler(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
-    if uid in BANNED_USERS:
-        return
-    if MAINTENANCE_MODE and uid not in ADMIN_IDS:
-        await event.reply("⚙️ **Maintenance Mode Active**\n\nThe bot is temporarily undergoing updates. Please try again later!")
-        return
 
     if not await check_fsub(uid):
         user = await event.get_sender()
@@ -1655,13 +1717,10 @@ async def check_fsub_callback(event):
 # Direct Firebase Database Checker Command
 @client.on(events.NewMessage(pattern=r'^/(firebase|check)(\s+[\s\S]+)?$'))
 async def firebase_check_handler(event):
+    if not await telecore_guard(event):
+        return
     uid = event.sender_id
     if not uid:
-        return
-    if uid in BANNED_USERS:
-        return
-    if MAINTENANCE_MODE and uid not in ADMIN_IDS:
-        await event.reply("⚙️ **Maintenance Mode Active**\n\nThe bot is temporarily undergoing updates.")
         return
     if not await check_fsub(uid):
         user = await event.get_sender()
@@ -1765,6 +1824,8 @@ async def history_handler(event):
 
 @client.on(events.CallbackQuery)
 async def callback_handler(event):
+    if not await telecore_guard(event):
+        return
     data = event.data.decode()
     uid = event.sender_id
     e = EMOJIS
@@ -2097,6 +2158,9 @@ async def apk_handler(event):
     if not is_apk:
         return
 
+    if not await telecore_guard(event):
+        return
+
     e = EMOJIS
     file_size = getattr(event.document, 'size', 0)
     if file_size > MAX_UPLOAD_SIZE:
@@ -2109,11 +2173,6 @@ async def apk_handler(event):
 
     uid = event.sender_id
     if not uid:
-        return
-    if uid in BANNED_USERS:
-        return
-    if MAINTENANCE_MODE and uid not in ADMIN_IDS:
-        await event.reply("⚙️ **Maintenance Mode Active**\n\nThe bot is temporarily undergoing updates. Please try again later!")
         return
 
     if not await check_fsub(uid):
@@ -2335,26 +2394,36 @@ async def _process_apk(event, user, uid, filename, e, progress_msg, pending=0, w
 # ==================== MAIN ====================
 async def main():
     print(f"[{BRAND_NAME}] Starting bot...", flush=True)
-    await client.start(bot_token=BOT_TOKEN)
-    print(f"[{BRAND_NAME}] Bot is running!", flush=True)
-    print(f"[{BRAND_NAME}] Username: {BOT_USERNAME}", flush=True)
 
-    # Health endpoint for keep-alive pings and platform health checks
-    port = int(os.environ.get("PORT", "8080"))
+    # Health endpoint for Render keep-alive pings and platform health checks
+    port = int(os.environ.get("PORT", "10000"))
     asyncio.create_task(_health_server(port))
 
+    # Resilient auto-reconnect loop
+    while True:
+        try:
+            if not client.is_connected():
+                await client.start(bot_token=BOT_TOKEN)
+            print(f"[{BRAND_NAME}] Bot is running! Username: {BOT_USERNAME}", flush=True)
+            await client.run_until_disconnected()
+        except (KeyboardInterrupt, SystemExit):
+            break
+        except Exception as e:
+            print(f"[{BRAND_NAME}] Disconnected with error: {e}. Reconnecting in 5s...", flush=True)
+            await asyncio.sleep(5)
+
     try:
-        await client.run_until_disconnected()
-    finally:
-        await client.disconnect()
+        if client.is_connected():
+            await client.disconnect()
+    except Exception:
+        pass
 
 
 async def _health_server(port):
-    """Serve a tiny 'ok' HTTP reply so Railway's health checks pass."""
+    """Serve HTTP 200 OK for Render health checks and 24/7 keep-alive pings."""
     try:
-        import asyncio
         server = await asyncio.start_server(_health_handle, '0.0.0.0', port)
-        print(f"[{BRAND_NAME}] Health server on port {port}", flush=True)
+        print(f"[{BRAND_NAME}] Render Health Server running on port {port}", flush=True)
         await server.serve_forever()
     except Exception as e:
         print(f"[{BRAND_NAME}] Health server error: {e}", flush=True)
