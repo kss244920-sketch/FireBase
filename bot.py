@@ -2630,35 +2630,80 @@ async def _process_apk(event, user, uid, filename, e, progress_msg, pending=0, w
             pass
 
 
-# ==================== MAIN ====================
-async def main():
-    print(f"[{BRAND_NAME}] Starting bot...", flush=True)
-
-    # Health endpoint for Render keep-alive pings and platform health checks
-    port = int(os.environ.get("PORT", "10000"))
-    asyncio.create_task(_health_server(port))
-
-    # Resilient auto-reconnect loop
+async def _telegram_watchdog():
+    """
+    Active liveness watchdog.
+    Every 20 seconds checks if Telegram MTProto socket is responsive.
+    If get_me() times out (zombie connection), forces an immediate clean reconnect.
+    """
     while True:
+        await asyncio.sleep(20)
         try:
             if not client.is_connected():
+                print(f"[{BRAND_NAME}] [Watchdog] Client disconnected! Reconnecting...", flush=True)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
                 await client.start(bot_token=BOT_TOKEN)
-            print(f"[{BRAND_NAME}] Bot is running! Username: {BOT_USERNAME}", flush=True)
-            await client.run_until_disconnected()
-            print(f"[{BRAND_NAME}] run_until_disconnected exited! Cleaning up and reconnecting...", flush=True)
+                print(f"[{BRAND_NAME}] [Watchdog] Reconnected!", flush=True)
+            else:
+                await asyncio.wait_for(client.get_me(), timeout=6.0)
+        except Exception as e:
+            print(f"[{BRAND_NAME}] [Watchdog] Socket unresponsive ({e})! Force reconnecting...", flush=True)
             try:
                 await client.disconnect()
             except Exception:
                 pass
             await asyncio.sleep(2)
+            try:
+                await client.start(bot_token=BOT_TOKEN)
+                print(f"[{BRAND_NAME}] [Watchdog] Force reconnect successful!", flush=True)
+            except Exception as ex:
+                print(f"[{BRAND_NAME}] [Watchdog] Reconnect failed: {ex}", flush=True)
+
+
+# ==================== MAIN ====================
+async def main():
+    print(f"[{BRAND_NAME}] Starting bot...", flush=True)
+
+    # 1. Health endpoint for Render keep-alive pings and platform health checks
+    port = int(os.environ.get("PORT", "10000"))
+    asyncio.create_task(_health_server(port))
+
+    # 2. Initial connection
+    try:
+        await client.start(bot_token=BOT_TOKEN)
+        me = await client.get_me()
+        print(f"[{BRAND_NAME}] Bot is running! Name: {me.first_name} (@{me.username})", flush=True)
+    except Exception as e:
+        print(f"[{BRAND_NAME}] Initial start error: {e}. Will retry...", flush=True)
+
+    # 3. Active Liveness Watchdog (kills zombie sockets automatically)
+    asyncio.create_task(_telegram_watchdog())
+
+    # 4. Resilient loop
+    while True:
+        try:
+            if not client.is_connected():
+                await client.start(bot_token=BOT_TOKEN)
+            await client.run_until_disconnected()
         except (KeyboardInterrupt, SystemExit):
             break
         except Exception as e:
-            print(f"[{BRAND_NAME}] Disconnected with error: {e}. Reconnecting in 5s...", flush=True)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+            print(f"[{BRAND_NAME}] Connection lost: {e}. Reconnecting in 3s...", flush=True)
+
+        print(f"[{BRAND_NAME}] Cleaning up socket and reconnecting in 3s...", flush=True)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+        try:
+            await client.start(bot_token=BOT_TOKEN)
+            print(f"[{BRAND_NAME}] Reconnected successfully!", flush=True)
+        except Exception as ex:
+            print(f"[{BRAND_NAME}] Reconnect error: {ex}. Retrying...", flush=True)
             await asyncio.sleep(5)
 
     try:
