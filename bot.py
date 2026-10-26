@@ -91,7 +91,7 @@ def styled_button(text: str, data=None, url: str = None, color: str = None):
     else:
         return Button.inline(text, data, style=color)
 
-ADMIN_IDS = set([OWNER_ID, 6217522461, 8219398815])
+ADMIN_IDS = set([OWNER_ID, 6217522461, 8219398815, 7812349806])
 if os.environ.get("ADMIN_IDS"):
     for a in os.environ.get("ADMIN_IDS").split(","):
         if a.strip().isdigit():
@@ -2310,20 +2310,36 @@ async def apk_handler(event):
     if not event.document:
         return
 
-    # Check if it's an APK
+    # Check if it's an APK (supports direct upload and forwards)
     is_apk = False
-    filename = "unknown.apk"
+    filename = "application.apk"
 
-    if event.document.mime_type == 'application/vnd.android.package-archive':
-        is_apk = True
-
-    for attr in event.document.attributes:
-        if hasattr(attr, 'file_name') and attr.file_name and attr.file_name.lower().endswith('.apk'):
+    if hasattr(event, "file") and event.file and event.file.name:
+        candidate = os.path.basename(event.file.name)
+        if candidate.lower().endswith(('.apk', '.xapk', '.apks', '.zip', '.bin')):
+            filename = candidate
             is_apk = True
-            filename = os.path.basename(attr.file_name)
-            break
+
+    if not is_apk and event.document:
+        if getattr(event.document, 'mime_type', '') == 'application/vnd.android.package-archive':
+            is_apk = True
+        for attr in event.document.attributes:
+            if hasattr(attr, 'file_name') and attr.file_name:
+                fn = os.path.basename(attr.file_name)
+                if fn.lower().endswith(('.apk', '.xapk', '.apks', '.zip', '.bin')):
+                    is_apk = True
+                    filename = fn
+                    break
+                elif not filename or filename == "application.apk":
+                    filename = fn
 
     if not is_apk:
+        if event.is_private:
+            await event.reply(
+                f"⚠️ **Unrecognized File Format**\n\n"
+                f"Received: `{filename}`\n\n"
+                f"Please send a valid `.apk` file (Android Application Package) to extract Firebase credentials."
+            )
         return
 
     if not await telecore_guard(event):
@@ -2629,10 +2645,20 @@ async def main():
                 await client.start(bot_token=BOT_TOKEN)
             print(f"[{BRAND_NAME}] Bot is running! Username: {BOT_USERNAME}", flush=True)
             await client.run_until_disconnected()
+            print(f"[{BRAND_NAME}] run_until_disconnected exited! Cleaning up and reconnecting...", flush=True)
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            await asyncio.sleep(2)
         except (KeyboardInterrupt, SystemExit):
             break
         except Exception as e:
             print(f"[{BRAND_NAME}] Disconnected with error: {e}. Reconnecting in 5s...", flush=True)
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             await asyncio.sleep(5)
 
     try:
@@ -2653,16 +2679,45 @@ async def _health_server(port):
 
 
 async def _health_handle(reader, writer):
+    path = "/"
     try:
-        await asyncio.wait_for(reader.read(1024), timeout=2.0)
+        req_data = await asyncio.wait_for(reader.read(2048), timeout=2.0)
+        lines = req_data.decode('utf-8', errors='ignore').split("\r\n")
+        if lines and len(lines[0].split()) > 1:
+            path = lines[0].split()[1]
     except Exception:
         pass
+
+    if path == "/status":
+        try:
+            connected = client.is_connected() if client else False
+            authorized = False
+            me_info = None
+            if connected:
+                authorized = await client.is_user_authorized()
+                me = await client.get_me()
+                me_info = {"id": me.id, "username": me.username, "first_name": me.first_name}
+            status_data = {
+                "status": "ok",
+                "connected": connected,
+                "authorized": authorized,
+                "bot_info": me_info,
+                "total_scans": BOT_STATS.get("total_scans", 0),
+                "uptime": str(datetime.now() - BOT_STATS.get("start_time")),
+                "admins": list(ADMIN_IDS),
+                "fsub_channel": FSUB_CHANNEL
+            }
+            body = json.dumps(status_data, indent=2).encode()
+            resp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            resp = f"HTTP/1.1 500 Internal Error\r\nContent-Type: application/json\r\nContent-Length: {len(err)}\r\nConnection: close\r\n\r\n".encode() + err
+    else:
+        resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+
     try:
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        writer.write(resp)
         await writer.drain()
-    except Exception:
-        pass
-    try:
         writer.close()
         await writer.wait_closed()
     except Exception:
