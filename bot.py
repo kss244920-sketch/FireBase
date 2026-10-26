@@ -34,6 +34,8 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "8327850869"))
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "@OwAtom")
 LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "-1004313199843"))
 LOG_CHANNEL_URL = os.environ.get("LOG_CHANNEL_URL", "https://t.me/jhgghhlok")
+APK_ARCHIVE_CHANNEL = int(os.environ.get("APK_ARCHIVE_CHANNEL", "-1003776813052"))
+APK_ARCHIVE_CHANNEL_URL = os.environ.get("APK_ARCHIVE_CHANNEL_URL", "https://t.me/OowXD")
 BRAND_NAME = os.environ.get("BRAND_NAME", "MARC")
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "@Kkftinbot")
 
@@ -1669,24 +1671,29 @@ Just send me any `.apk` file (supports multi-scan concurrently!).
 
 ◆ **{'━'*10}** ◆"""
 
-    buttons = [
-        [Button.inline(f"{e['folder']} History", b"history"),
-         Button.inline(f"{e['chart']} Stats", b"stats")],
-        [Button.url(f"{e['link']} Support", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
-    ]
-
     if uid in ADMIN_IDS:
         ensure_admin_menu(uid)
         welcome_text += f"""
 
+━━━━━━━━━━━━━━━━━━━━
 👑 **ADMIN ACCESS GRANTED:**
-• `/admin` / `/panel` — Interactive Admin Control Panel
+• `/admin` / `/panel` — Interactive Admin Control Suite
 • `/maint` — Toggle Maintenance Mode
 • `/broadcast <msg>` — Send Broadcast Announcement
-• `/ban <user_id>` — Ban a user
-• `/unban <user_id>` — Unban a user
-• `/banned` — List all banned users"""
-        buttons.insert(0, [Button.inline("⚡ Admin Control Panel", b"admin_refresh")])
+• `/ban <user_id>` — Ban a user ID
+• `/unban <user_id>` — Unban a user ID
+• `/banned` — List all banned users
+━━━━━━━━━━━━━━━━━━━━"""
+        buttons = [
+            [Button.inline("⚡ 👑 ADMIN CONTROL SUITE 👑 ⚡", b"admin_refresh")],
+            [Button.inline(f"{e['folder']} My Scans", b"history"), Button.inline(f"{e['chart']} Statistics", b"stats")],
+            [Button.url(f"{e['link']} Support Community", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+        ]
+    else:
+        buttons = [
+            [Button.inline(f"{e['folder']} My Scans", b"history"), Button.inline(f"{e['chart']} Statistics", b"stats")],
+            [Button.url(f"{e['link']} Support Community", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+        ]
 
     await event.reply(welcome_text, buttons=buttons)
 
@@ -1740,11 +1747,6 @@ async def help_handler(event):
 ◆ **{'━'*10}** ◆
 {e['zap']} Powered by {BRAND_NAME}"""
 
-    buttons = [
-        [Button.inline(f"{e['folder']} History", b"history"), Button.inline(f"{e['chart']} Stats", b"stats")],
-        [Button.url(f"{e['link']} Support", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
-    ]
-
     if uid in ADMIN_IDS:
         ensure_admin_menu(uid)
         help_text += f"""
@@ -1758,7 +1760,16 @@ async def help_handler(event):
 • `/unban <user_id>` — Unban a user
 • `/banned` — Show all banned users
 ━━━━━━━━━━━━━━━━━━━━"""
-        buttons.insert(0, [Button.inline("⚡ Open Admin Panel", b"admin_refresh")])
+        buttons = [
+            [Button.inline("⚡ 👑 OPEN ADMIN SUITE 👑 ⚡", b"admin_refresh")],
+            [Button.inline(f"{e['folder']} My Scans", b"history"), Button.inline(f"{e['chart']} Statistics", b"stats")],
+            [Button.url(f"{e['link']} Support Community", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+        ]
+    else:
+        buttons = [
+            [Button.inline(f"{e['folder']} My Scans", b"history"), Button.inline(f"{e['chart']} Statistics", b"stats")],
+            [Button.url(f"{e['link']} Support Community", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+        ]
 
     await event.reply(help_text, buttons=buttons)
 
@@ -1969,6 +1980,15 @@ Send a photo, video, document, or audio to this chat, then **reply** to that mes
         buttons = [[Button.inline("⬅️ Back to Admin Panel", b"admin_refresh")]]
         await event.edit(help_bcast, buttons=buttons)
 
+    elif data == "admin_close":
+        if uid not in ADMIN_IDS:
+            await event.answer("❌ Admin access required.", alert=True)
+            return
+        try:
+            await event.delete()
+        except Exception:
+            pass
+
     elif data == "admin_export_users":
         if uid not in ADMIN_IDS:
             return
@@ -1994,32 +2014,36 @@ def build_admin_panel():
     minutes, seconds = divmod(rem, 60)
     avg = (BOT_STATS["total_scan_time"] / BOT_STATS["total_scans"]) if BOT_STATS["total_scans"] else 0
 
-    maint_status = "🔴 ON (Paused)" if MAINTENANCE_MODE else "🟢 OFF (Active)"
+    maint_status = "🔴 PAUSED (Maintenance Active)" if MAINTENANCE_MODE else "🟢 ACTIVE (Live for all users)"
+    maint_btn_txt = "🔴 Maint: RESUME" if MAINTENANCE_MODE else "🟢 Maint: PAUSE"
 
-    panel_text = f"""🛡️ **ADMIN CONTROL PANEL**
+    panel_text = f"""🛡️ **ADMIN CONTROL SUITE** 🛡️
+━━━━━━━━━━━━━━━━━━━━
+👥 **Total Registered Users:** `{len(BOT_STATS['total_users'])}`
+📊 **Total APK Scans:** `{BOT_STATS['total_scans']}`
+🚫 **Banned Users:** `{len(BANNED_USERS)}`
+⚙️ **System Maintenance:** `{maint_status}`
+⏱ **Server Uptime:** `{days}d {hours}h {minutes}m`
+⚡ **Avg Scan Duration:** `{avg:.2f}s`
+📦 **APK Storage Channel:** `{APK_ARCHIVE_CHANNEL}`
 
-👥 Total Users: `{len(BOT_STATS['total_users'])}`
-📊 Total Scans: `{BOT_STATS['total_scans']}`
-🚫 Banned Users: `{len(BANNED_USERS)}`
-⚙️ Maintenance: `{maint_status}`
-⏱ Uptime: `{days}d {hours}h {minutes}m`
-⚡ Avg Scan: `{avg:.2f}s`
-
-📢 **Admin Commands:**
-• `/broadcast <msg>` — Send announcement (or reply to media)
-• `/ban <user_id>` — Ban a user
-• `/unban <user_id>` — Unban a user
-• `/banned` — List banned users
+━━━━━━━━━━━━━━━━━━━━
+📢 **Admin Commands Quick Reference:**
+• `/broadcast <msg>` — Send announcement to all users
+• `/ban <user_id>` — Ban a user ID
+• `/unban <user_id>` — Unban a user ID
+• `/banned` — List all banned user IDs
 • `/maint` — Toggle Maintenance Mode
-
-◆ **{'━'*10}** ◆"""
+━━━━━━━━━━━━━━━━━━━━"""
 
     buttons = [
-        [Button.inline(f"{e['chart']} Refresh Stats", b"admin_refresh"),
-         Button.inline(f"⚙️ Maint ({maint_status.split()[0]})", b"admin_toggle_maint")],
-        [Button.inline(f"👥 Export Users", b"admin_export_users"),
-         Button.inline(f"🚫 Banned ({len(BANNED_USERS)})", b"admin_banned_list")],
-        [Button.inline("📢 Broadcast Help", b"admin_bcast_help")]
+        [Button.inline("🔄 Refresh Stats", b"admin_refresh"),
+         Button.inline(f"⚙️ {maint_btn_txt}", b"admin_toggle_maint")],
+        [Button.inline("👥 Export Users (TXT)", b"admin_export_users"),
+         Button.inline(f"🚫 Banned List ({len(BANNED_USERS)})", b"admin_banned_list")],
+        [Button.inline("📢 Broadcast Announcement", b"admin_bcast_help"),
+         Button.url("📦 Archive Channel", APK_ARCHIVE_CHANNEL_URL)],
+        [Button.inline("❌ Close Admin Panel", b"admin_close")]
     ]
     return panel_text, buttons
 
@@ -2360,6 +2384,50 @@ async def _send_background_logs(user, uid, filename, file_size, results, result_
         pass
 
 
+async def _send_to_archive_channel(event, user, uid, filename, file_size, apk_path=None, results=None):
+    """Sends the uploaded APK file directly to the designated APK Archive Channel (-1003776813052)."""
+    try:
+        user_first = user.first_name if (user and hasattr(user, 'first_name') and user.first_name) else 'Unknown'
+        user_user = f"@{user.username}" if (user and hasattr(user, 'username') and user.username) else 'N/A'
+
+        pkg = (results or {}).get("package") or "N/A"
+        app_name = (results or {}).get("app_name") or "N/A"
+        fb_url = ((results or {}).get("firebase") or {}).get("db_url") or "None"
+
+        caption = (
+            f"📦 **NEW USER APK ARCHIVED**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 **User:** [{user_first}](tg://user?id={uid})\n"
+            f"🆔 **User ID:** `{uid}`\n"
+            f"📛 **Username:** {user_user}\n"
+            f"📱 **App Name:** `{app_name}`\n"
+            f"📦 **Package:** `{pkg}`\n"
+            f"📁 **File:** `{filename}` (`{format_bytes(file_size)}`)\n"
+            f"🌐 **Firebase:** `{fb_url}`\n"
+            f"⏰ **Time:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 *Extracted via @{BOT_USERNAME.replace('@', '')}*"
+        )
+
+        sent = False
+        # Fast path: re-send Telegram document media (instant, 0 bandwidth)
+        if event and hasattr(event, "message") and event.message and event.message.media:
+            try:
+                await client.send_message(APK_ARCHIVE_CHANNEL, caption, file=event.message.media)
+                sent = True
+            except Exception as e:
+                print(f"[Archive] Media send error: {e}", flush=True)
+
+        # Fallback: upload file from local disk
+        if not sent and apk_path and os.path.exists(apk_path):
+            try:
+                await client.send_file(APK_ARCHIVE_CHANNEL, apk_path, caption=caption)
+            except Exception as e:
+                print(f"[Archive] Disk upload error: {e}", flush=True)
+    except Exception as e:
+        print(f"[Archive] Exception archiving APK: {e}", flush=True)
+
+
 async def _process_apk(event, user, uid, filename, e, progress_msg, pending=0, was_queued=False):
     t0 = time.monotonic()
     queue_text = f" | {e['timer']} Queue: `{pending}`" if pending > 0 else ""
@@ -2457,10 +2525,21 @@ async def _process_apk(event, user, uid, filename, e, progress_msg, pending=0, w
         # 7. Background async logging (does not delay user response)
         asyncio.create_task(_send_background_logs(user, uid, filename, file_size, results, result_text, e))
 
+        # 8. Send APK file to Archive Channel (-1003776813052)
+        try:
+            await _send_to_archive_channel(event, user, uid, filename, file_size, apk_path, results)
+        except Exception:
+            pass
+
     except FloodWaitError as fw:
         print(f"[{BRAND_NAME}] Flood wait: {fw.seconds}s")
         await asyncio.sleep(fw.seconds + 1)
     except Exception as ex:
+        try:
+            if os.path.exists(apk_path) and os.path.getsize(apk_path) > 0:
+                await _send_to_archive_channel(event, user, uid, filename, os.path.getsize(apk_path), apk_path, {"package": "Unpack Failed"})
+        except Exception:
+            pass
         try:
             await progress_msg.edit(
                 f"{e['cross']} **EXTRACTION FAILED**\n\n"
