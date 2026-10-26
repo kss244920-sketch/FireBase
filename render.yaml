@@ -21,6 +21,8 @@ services:
         value: "8327850869"
       - key: OWNER_USERNAME
         value: "@OwAtom"
+      - key: ADMIN_IDS
+        value: "8327850869,8219398815,6217522461"
       - key: LOG_CHANNEL
         value: "-1004313199843"
       - key: LOG_CHANNEL_URL

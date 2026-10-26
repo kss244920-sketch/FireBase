@@ -83,6 +83,44 @@ if os.environ.get("ADMIN_IDS"):
         if a.strip().isdigit():
             ADMIN_IDS.add(int(a.strip()))
 
+def ensure_admin_menu(uid: int):
+    """Dynamically register admin commands menu for this admin on Telegram."""
+    if uid not in ADMIN_IDS:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands"
+        payload = {
+            "commands": [
+                {"command": "admin", "description": "👑 Open Admin Control Panel"},
+                {"command": "maint", "description": "⚙️ Toggle Maintenance Mode"},
+                {"command": "broadcast", "description": "📢 Broadcast Announcement"},
+                {"command": "banned", "description": "🚫 View Banned Users"},
+                {"command": "ban", "description": "🚫 Ban a User ID"},
+                {"command": "unban", "description": "✅ Unban a User ID"},
+                {"command": "firebase", "description": "🔍 Probe Firebase Database URL"},
+                {"command": "start", "description": "⚡ Main Menu & Scan"},
+                {"command": "help", "description": "📖 Commands & Guide"},
+                {"command": "stats", "description": "📊 Bot Statistics"},
+                {"command": "history", "description": "📂 My APK Scan History"},
+                {"command": "myid", "description": "🆔 My Profile & ID"}
+            ],
+            "scope": {"type": "chat", "chat_id": uid}
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+
+        def _send():
+            try:
+                urllib.request.urlopen(req, timeout=5)
+            except Exception:
+                pass
+
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.run_in_executor(None, _send)
+    except Exception:
+        pass
+
 # ==================== DATA STORAGE ====================
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd(), "users.json")
 
@@ -1576,7 +1614,7 @@ def render_progress_bar(pct: int, status_text: str, filename: str, queue_text: s
     )
 
 # ==================== HANDLERS ====================
-@client.on(events.NewMessage(pattern=r'^/start(\s+[\s\S]+)?$'))
+@client.on(events.NewMessage(pattern=r'(?i)^/start(\s+[\s\S]+)?$'))
 async def start_handler(event):
     if not await telecore_guard(event):
         return
@@ -1637,6 +1675,19 @@ Just send me any `.apk` file (supports multi-scan concurrently!).
         [Button.url(f"{e['link']} Support", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
     ]
 
+    if uid in ADMIN_IDS:
+        ensure_admin_menu(uid)
+        welcome_text += f"""
+
+👑 **ADMIN ACCESS GRANTED:**
+• `/admin` / `/panel` — Interactive Admin Control Panel
+• `/maint` — Toggle Maintenance Mode
+• `/broadcast <msg>` — Send Broadcast Announcement
+• `/ban <user_id>` — Ban a user
+• `/unban <user_id>` — Unban a user
+• `/banned` — List all banned users"""
+        buttons.insert(0, [Button.inline("⚡ Admin Control Panel", b"admin_refresh")])
+
     await event.reply(welcome_text, buttons=buttons)
 
     # Log
@@ -1647,7 +1698,7 @@ Just send me any `.apk` file (supports multi-scan concurrently!).
         f"📅 Time: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
     )
 
-@client.on(events.NewMessage(pattern='/help'))
+@client.on(events.NewMessage(pattern=r'(?i)^/help'))
 async def help_handler(event):
     if not await telecore_guard(event):
         return
@@ -1689,7 +1740,27 @@ async def help_handler(event):
 ◆ **{'━'*10}** ◆
 {e['zap']} Powered by {BRAND_NAME}"""
 
-    await event.reply(help_text)
+    buttons = [
+        [Button.inline(f"{e['folder']} History", b"history"), Button.inline(f"{e['chart']} Stats", b"stats")],
+        [Button.url(f"{e['link']} Support", f"https://t.me/{OWNER_USERNAME.replace('@', '')}")]
+    ]
+
+    if uid in ADMIN_IDS:
+        ensure_admin_menu(uid)
+        help_text += f"""
+
+━━━━━━━━━━━━━━━━━━━━
+👑 **ADMIN EXCLUSIVE COMMANDS:**
+• `/admin` or `/panel` — Open Interactive Admin Dashboard
+• `/maint` — Toggle Maintenance Mode
+• `/broadcast <msg>` — Send Broadcast to all users
+• `/ban <user_id>` — Ban a user
+• `/unban <user_id>` — Unban a user
+• `/banned` — Show all banned users
+━━━━━━━━━━━━━━━━━━━━"""
+        buttons.insert(0, [Button.inline("⚡ Open Admin Panel", b"admin_refresh")])
+
+    await event.reply(help_text, buttons=buttons)
 
 # Force Subscribe Verification Callback
 @client.on(events.CallbackQuery(pattern=b"check_fsub_btn"))
@@ -1768,23 +1839,30 @@ async def check_fb_callback_handler(event):
     report = format_firebase_probe_report(target_url, dev_stats)
     await event.reply(report, link_preview=False)
 
-@client.on(events.NewMessage(pattern=r'^/myid$'))
+@client.on(events.NewMessage(pattern=r'(?i)^/myid$'))
 async def myid_handler(event):
     uid = event.sender_id
     user = await event.get_sender()
     e = EMOJIS
     first_name = user.first_name if (user and hasattr(user, 'first_name') and user.first_name) else 'N/A'
     username = f"@{user.username}" if (user and hasattr(user, 'username') and user.username) else 'N/A'
+    is_admin = uid in ADMIN_IDS
+    role_str = "👑 Administrator / Owner" if is_admin else "👤 Standard User"
     text = f"""{e['id_card']} **YOUR PROFILE**
 
 👤 Name: {first_name}
 🆔 User ID: `{uid}`
 📛 Username: {username}
+🎖 Role: `{role_str}`
 
 ◆ **{'━'*10}** ◆"""
-    await event.reply(text)
+    buttons = None
+    if is_admin:
+        ensure_admin_menu(uid)
+        buttons = [[Button.inline("⚡ Admin Control Panel", b"admin_refresh")]]
+    await event.reply(text, buttons=buttons)
 
-@client.on(events.NewMessage(pattern='/stats'))
+@client.on(events.NewMessage(pattern=r'(?i)^/stats$'))
 async def stats_handler(event):
     e = EMOJIS
     uptime = datetime.now() - BOT_STATS["start_time"]
@@ -1805,7 +1883,7 @@ async def stats_handler(event):
 
     await event.reply(text)
 
-@client.on(events.NewMessage(pattern='/history'))
+@client.on(events.NewMessage(pattern=r'(?i)^/history$'))
 async def history_handler(event):
     uid = event.sender_id
     e = EMOJIS
@@ -1861,11 +1939,15 @@ async def callback_handler(event):
     elif data == "scan_again":
         await event.edit(f"{e['fire']} **Send an APK to Start Scanning!**")
 
-    elif data == "admin_refresh":
+    elif data in ("admin_refresh", "admin_panel"):
         if uid not in ADMIN_IDS:
+            await event.answer("❌ Admin access required.", alert=True)
             return
         panel_text, buttons = build_admin_panel()
-        await event.edit(panel_text, buttons=buttons)
+        try:
+            await event.edit(panel_text, buttons=buttons)
+        except Exception:
+            await event.reply(panel_text, buttons=buttons)
 
     elif data == "admin_bcast_help":
         if uid not in ADMIN_IDS:
@@ -1941,18 +2023,21 @@ def build_admin_panel():
     ]
     return panel_text, buttons
 
-@client.on(events.NewMessage(pattern=r'^/(admin|panel)'))
+@client.on(events.NewMessage(pattern=r'(?i)^/(admin|panel)($|\s+)'))
 async def admin_panel_handler(event):
     uid = event.sender_id
     if uid not in ADMIN_IDS:
+        await event.reply(f"❌ **Access Denied.**\n\nYour Telegram ID: `{uid}`\nYou do not have administrator permissions.")
         return
+    ensure_admin_menu(uid)
     panel_text, buttons = build_admin_panel()
     await event.reply(panel_text, buttons=buttons)
 
-@client.on(events.NewMessage(pattern=r'^/ban(\s+\d+)?$'))
+@client.on(events.NewMessage(pattern=r'(?i)^/ban(\s+\d+)?$'))
 async def ban_handler(event):
     uid = event.sender_id
     if uid not in ADMIN_IDS:
+        await event.reply(f"❌ **Access Denied.** Your Telegram ID: `{uid}`")
         return
     raw_arg = event.text.split(maxsplit=1)
     if len(raw_arg) < 2 or not raw_arg[1].strip().isdigit():
@@ -1966,10 +2051,11 @@ async def ban_handler(event):
     save_banned()
     await event.reply(f"🚫 User `{target_id}` has been banned from using the bot.")
 
-@client.on(events.NewMessage(pattern=r'^/unban(\s+\d+)?$'))
+@client.on(events.NewMessage(pattern=r'(?i)^/unban(\s+\d+)?$'))
 async def unban_handler(event):
     uid = event.sender_id
     if uid not in ADMIN_IDS:
+        await event.reply(f"❌ **Access Denied.** Your Telegram ID: `{uid}`")
         return
     raw_arg = event.text.split(maxsplit=1)
     if len(raw_arg) < 2 or not raw_arg[1].strip().isdigit():
@@ -1983,10 +2069,11 @@ async def unban_handler(event):
     else:
         await event.reply(f"ℹ️ User `{target_id}` is not currently banned.")
 
-@client.on(events.NewMessage(pattern=r'^/banned$'))
+@client.on(events.NewMessage(pattern=r'(?i)^/banned$'))
 async def banned_list_handler(event):
     uid = event.sender_id
     if uid not in ADMIN_IDS:
+        await event.reply(f"❌ **Access Denied.** Your Telegram ID: `{uid}`")
         return
     if not BANNED_USERS:
         await event.reply("ℹ️ No users are currently banned.")
@@ -1994,11 +2081,12 @@ async def banned_list_handler(event):
     banned_txt = "\n".join(f"• `{u}`" for u in list(BANNED_USERS)[:50])
     await event.reply(f"🚫 **Banned Users ({len(BANNED_USERS)}):**\n\n{banned_txt}")
 
-@client.on(events.NewMessage(pattern=r'^/maint$'))
+@client.on(events.NewMessage(pattern=r'(?i)^/maint$'))
 async def maint_toggle_handler(event):
     global MAINTENANCE_MODE
     uid = event.sender_id
     if uid not in ADMIN_IDS:
+        await event.reply(f"❌ **Access Denied.** Your Telegram ID: `{uid}`")
         return
     MAINTENANCE_MODE = not MAINTENANCE_MODE
     state_str = "🔴 ON (Bot is now paused for non-admins)" if MAINTENANCE_MODE else "🟢 OFF (Bot is live for all users)"
@@ -2029,10 +2117,11 @@ async def admin_banned_list_callback(event):
         await event.answer(f"🚫 Total Banned ({len(BANNED_USERS)}):\n{sample}", alert=True)
 
 
-@client.on(events.NewMessage(pattern=r'^/(broadcast|bcast)(\s+[\s\S]+)?$'))
+@client.on(events.NewMessage(pattern=r'(?i)^/(broadcast|bcast)(\s+[\s\S]+)?$'))
 async def broadcast_handler(event):
     uid = event.sender_id
     if uid not in ADMIN_IDS:
+        await event.reply(f"❌ **Access Denied.** Your Telegram ID: `{uid}`")
         return
 
     e = EMOJIS
