@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Firebase Bot Showcase & Promotional Video Generator
-Generates a high-fidelity 720x720 30fps MP4 motion graphics video matching
-Telegram's official feature presentation aesthetics, complete with native colored buttons,
-device mockups, and synchronized background soundtrack.
+Hyper-Realistic Telegram Motion Graphics Video Generator for Firebase Bot (@Kkftinbot)
+2x Retina Supersampling (1440x1440 downscaled to 720x720) for crystal-clear antialiasing,
+exact Telegram Dark Mode UI (#0e1621, #17212b, #182533, #2b5278), authentic button styles,
+realistic 3D smartphone chassis, specular glass reflections, interactive touch cursor,
+and synchronized upbeat audio soundtrack.
 """
 
 import os
@@ -14,29 +15,32 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-W, H = 720, 720
+S = 2  # Super-sampling factor for Retina crispness
+W, H = 720 * S, 720 * S
+FINAL_W, FINAL_H = 720, 720
 FPS = 30
 DURATION = 13.096  # Exact duration of reference audio
-TOTAL_FRAMES = int(DURATION * FPS)  # 393 frames
+TOTAL_FRAMES = int(DURATION * FPS)  # 392 frames
 
-FRAMES_DIR = "/tmp/promo_frames"
+FRAMES_DIR = "/tmp/promo_retina_frames"
 AUDIO_FILE = "/tmp/reference_audio.aac"
 OUTPUT_VIDEO = "/home/piyush/Desktop/Firebase_Bot_Showcase.mp4"
 
-# Load Fonts
-FONT_TITLE = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 32)
-FONT_SIDE = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 36)
-FONT_SIDE_SUB = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 17)
-FONT_CHAT = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 12)
-FONT_CHAT_BOLD = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 12)
-FONT_BTN = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 11)
+# Fonts scaled at 2x
+FONT_TITLE = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 32 * S)
+FONT_SIDE = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 36 * S)
+FONT_SIDE_SUB = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 17 * S)
+FONT_CHAT = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 12 * S)
+FONT_CHAT_BOLD = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 12 * S)
+FONT_CODE = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 11 * S)
+FONT_BTN = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 11 * S)
 FONT_EMOJI_BASE = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", 109)
 
-# Pre-render Emojis
 EMOJI_CACHE = {}
 
 def get_emoji(char, size=18):
-    key = (char, size)
+    size_scaled = size * S
+    key = (char, size_scaled)
     if key in EMOJI_CACHE:
         return EMOJI_CACHE[key]
     canvas = Image.new("RGBA", (140, 140), (0, 0, 0, 0))
@@ -45,15 +49,16 @@ def get_emoji(char, size=18):
     bbox = canvas.getbbox()
     if bbox:
         canvas = canvas.crop(bbox)
-    canvas = canvas.resize((size, size), Image.Resampling.LANCZOS)
+    canvas = canvas.resize((size_scaled, size_scaled), Image.Resampling.LANCZOS)
     EMOJI_CACHE[key] = canvas
     return canvas
 
 def paste_emoji_text(target_img, draw, x, y, emoji_char, text, font, fill, emoji_size=16):
+    e_size = emoji_size * S
     if emoji_char:
         em = get_emoji(emoji_char, emoji_size)
-        target_img.paste(em, (x, y + (font.size - emoji_size)//2), em)
-        draw.text((x + emoji_size + 4, y), text, fill=fill, font=font)
+        target_img.paste(em, (x, y + (font.size - e_size) // 2), em)
+        draw.text((x + e_size + 6 * S, y), text, fill=fill, font=font)
     else:
         draw.text((x, y), text, fill=fill, font=font)
 
@@ -70,289 +75,324 @@ def render_frame_worker(frame_idx):
     img = Image.new("RGBA", (W, H), (0, 0, 0, 255))
     draw = ImageDraw.Draw(img)
 
-    # 1. Background Gradient (Telegram Blue to Vibrant Violet)
+    # 1. Background Gradient (Vibrant Telegram Sky Blue to Deep Indigo)
     for y in range(H):
         r_ratio = y / float(H)
-        r = int(90 * (1 - r_ratio) + 122 * r_ratio)
-        g = int(155 * (1 - r_ratio) + 148 * r_ratio)
-        b = int(252 * (1 - r_ratio) + 255 * r_ratio)
+        r = int(52 * (1 - r_ratio) + 94 * r_ratio)
+        g = int(122 * (1 - r_ratio) + 104 * r_ratio)
+        b = int(246 * (1 - r_ratio) + 252 * r_ratio)
         draw.line([(0, y), (W, y)], fill=(r, g, b))
 
-    # Floating Ambient Glow Orbs
-    pulse = math.sin(sec * 1.5) * 20
-    for ox, oy, orad, oalpha in [(90, 140, int(160 + pulse), 22), (610, 560, int(220 - pulse), 26)]:
+    # Floating Ambient Glowing Orbs
+    pulse = math.sin(sec * 1.5) * 15 * S
+    for ox, oy, orad, oalpha in [(110 * S, 130 * S, int(180 * S + pulse), 32),
+                                (610 * S, 570 * S, int(240 * S - pulse), 38)]:
         orb = Image.new("RGBA", (orad * 2, orad * 2), (0, 0, 0, 0))
         odraw = ImageDraw.Draw(orb)
         odraw.ellipse([0, 0, orad * 2, orad * 2], fill=(255, 255, 255, oalpha))
-        orb = orb.filter(ImageFilter.GaussianBlur(35))
+        orb = orb.filter(ImageFilter.GaussianBlur(35 * S))
         img.paste(orb, (ox - orad, oy - orad), orb)
 
-    # 2. Top Header Bar: Telegram Paperplane + "Firebase Extractor"
-    header_y = 34
-    draw.ellipse([(55, header_y), (100, header_y + 45)], fill=(255, 255, 255))
-    draw.polygon([(67, header_y + 23), (90, header_y + 14), (83, header_y + 35)], fill=(80, 150, 245))
-    draw.polygon([(73, header_y + 25), (83, header_y + 35), (78, header_y + 28)], fill=(50, 120, 215))
+    # 2. Top Header Bar (Glassmorphic Translucent Pill)
+    head_w, head_h = 326 * S, 48 * S
+    head_x, head_y = 44 * S, 32 * S
+    pill = Image.new("RGBA", (head_w, head_h), (0, 0, 0, 0))
+    pdraw = ImageDraw.Draw(pill)
+    pdraw.rounded_rectangle([0, 0, head_w, head_h], radius=24 * S, fill=(255, 255, 255, 42), outline=(255, 255, 255, 85), width=1 * S)
+    img.paste(pill, (head_x, head_y), pill)
 
-    draw.text((112, header_y + 4), "Firebase Extractor", fill=(255, 255, 255), font=FONT_TITLE)
+    # Telegram Circular Icon inside pill
+    icon_size = 36 * S
+    draw.ellipse([(head_x + 8 * S, head_y + 6 * S), (head_x + 8 * S + icon_size, head_y + 6 * S + icon_size)], fill=(255, 255, 255))
+    ix, iy = head_x + 8 * S, head_y + 6 * S
+    draw.polygon([(ix + 10 * S, iy + 18 * S), (ix + 28 * S, iy + 11 * S), (ix + 22 * S, iy + 28 * S)], fill=(45, 135, 235))
+    draw.polygon([(ix + 15 * S, iy + 20 * S), (ix + 22 * S, iy + 28 * S), (ix + 18 * S, iy + 22 * S)], fill=(25, 105, 205))
 
-    # 3. Phone Animation & Geometry
-    phone_w = 340
-    phone_h = 574
-    phone_y = 108
+    draw.text((head_x + 52 * S, head_y + 6 * S), "Firebase Extractor", fill=(255, 255, 255), font=FONT_TITLE)
 
-    # Phone slides from center (180) to left (62) during first 1.2s
+    # 3. Smartphone Mockup (Realistic Titanium Bezel & Dark Mode Screen)
+    phone_w = 346 * S
+    phone_h = 582 * S
+
+    # Smooth slide in from center (180) to left (58) during first 1.2s
     if sec < 1.2:
         slide_prog = ease_out_cubic(sec / 1.2)
-        phone_x = int(180 - (180 - 62) * slide_prog)
+        phone_x = int((180 * S) - ((180 - 58) * S) * slide_prog)
     else:
-        phone_x = 62
+        phone_x = 58 * S
 
-    # Phone Drop Shadow
-    shadow = Image.new("RGBA", (phone_w + 50, phone_h + 50), (0, 0, 0, 0))
+    # Floating levitation effect
+    float_y = int(math.sin(sec * 1.8) * 4 * S)
+    phone_y = (98 * S) + float_y
+
+    # Drop shadow under phone
+    shadow = Image.new("RGBA", (phone_w + 60 * S, phone_h + 60 * S), (0, 0, 0, 0))
     sdraw = ImageDraw.Draw(shadow)
-    sdraw.rounded_rectangle([25, 25, phone_w + 25, phone_h + 25], radius=38, fill=(0, 0, 0, 85))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(22))
-    img.paste(shadow, (phone_x - 25, phone_y - 12), shadow)
+    sdraw.rounded_rectangle([30 * S, 30 * S, phone_w + 30 * S, phone_h + 30 * S], radius=44 * S, fill=(0, 0, 0, 115))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(24 * S))
+    img.paste(shadow, (phone_x - 30 * S, phone_y - 12 * S), shadow)
 
-    # Phone Outer Bezel (Sleek Titanium Dark)
+    # Outer Titanium Bezel
     draw.rounded_rectangle([phone_x, phone_y, phone_x + phone_w, phone_y + phone_h],
-                           radius=36, fill=(18, 22, 28), outline=(65, 75, 88), width=3)
+                           radius=42 * S, fill=(28, 34, 42), outline=(75, 88, 102), width=3 * S)
 
-    # Phone Screen
-    screen_x = phone_x + 8
-    screen_y = phone_y + 8
-    screen_w = phone_w - 16
-    screen_h = phone_h - 16
+    # Screen inside phone
+    screen_x = phone_x + 8 * S
+    screen_y = phone_y + 8 * S
+    screen_w = phone_w - 16 * S
+    screen_h = phone_h - 16 * S
 
-    screen = Image.new("RGBA", (screen_w, screen_h), (236, 241, 246))
+    screen = Image.new("RGBA", (screen_w, screen_h), (14, 22, 33))  # Telegram Dark Mode #0e1621
     s_draw = ImageDraw.Draw(screen)
 
-    # Screen Status Bar
-    s_draw.rectangle([0, 0, screen_w, 24], fill=(36, 129, 204))
-    s_draw.text((16, 5), "9:41", fill=(255, 255, 255), font=FONT_CHAT_BOLD)
-    s_draw.rectangle([screen_w - 32, 8, screen_w - 14, 18], fill=(255, 255, 255))
-    s_draw.ellipse([(screen_w // 2 - 6, 6), (screen_w // 2 + 6, 18)], fill=(12, 14, 18))
+    # Status Bar
+    s_draw.text((18 * S, 6 * S), "9:41", fill=(255, 255, 255), font=FONT_CHAT_BOLD)
+    s_draw.rectangle([screen_w - 34 * S, 9 * S, screen_w - 14 * S, 19 * S], fill=(255, 255, 255))
+    s_draw.ellipse([(screen_w // 2 - 6 * S, 7 * S), (screen_w // 2 + 6 * S, 19 * S)], fill=(8, 12, 16))
 
-    # Telegram Header Bar inside Phone
-    bar_y = 24
-    bar_h = 44
-    s_draw.rectangle([0, bar_y, screen_w, bar_y + bar_h], fill=(36, 129, 204))
-    s_draw.polygon([(18, bar_y + 22), (26, bar_y + 14), (26, bar_y + 30)], fill=(255, 255, 255))
+    # Telegram Chat App Bar (#17212b)
+    bar_y = 26 * S
+    bar_h = 44 * S
+    s_draw.rectangle([0, bar_y, screen_w, bar_y + bar_h], fill=(23, 33, 43))
+    s_draw.polygon([(18 * S, bar_y + 22 * S), (26 * S, bar_y + 14 * S), (26 * S, bar_y + 30 * S)], fill=(120, 145, 170))
 
-    # Avatar with Fire emoji
-    s_draw.ellipse([(38, bar_y + 7), (68, bar_y + 37)], fill=(255, 140, 0))
+    # Avatar with Flame Emoji
+    s_draw.ellipse([(38 * S, bar_y + 7 * S), (68 * S, bar_y + 37 * S)], fill=(255, 140, 0))
     em_flame = get_emoji("🔥", 18)
-    screen.paste(em_flame, (44, bar_y + 13), em_flame)
+    screen.paste(em_flame, (44 * S, bar_y + 13 * S), em_flame)
 
-    s_draw.text((78, bar_y + 8), "Firebase Extractor", fill=(255, 255, 255), font=FONT_CHAT_BOLD)
-    s_draw.text((78, bar_y + 24), "bot • @Kkftinbot", fill=(200, 230, 255), font=FONT_CHAT)
+    s_draw.text((78 * S, bar_y + 8 * S), "Firebase Extractor Bot", fill=(255, 255, 255), font=FONT_CHAT_BOLD)
+    s_draw.text((78 * S, bar_y + 24 * S), "bot • @Kkftinbot", fill=(100, 165, 225), font=FONT_CHAT)
 
-    # CHAT MESSAGES LOGIC
-    # User message: Uploading APK file
-    ub_y = 80
-    ub_w = 230
-    ub_h = 56
-    ub_x = screen_w - ub_w - 12
-    s_draw.rounded_rectangle([ub_x, ub_y, ub_x + ub_w, ub_y + ub_h], radius=12, fill=(236, 255, 222))
-    s_draw.ellipse([(ub_x + 8, ub_y + 10), (ub_x + 44, ub_y + 46)], fill=(100, 180, 240))
-    s_draw.text((ub_x + 16, ub_y + 17), "APK", fill=(255, 255, 255), font=FONT_CHAT_BOLD)
-    s_draw.text((ub_x + 52, ub_y + 12), "production_app.apk", fill=(20, 20, 20), font=FONT_CHAT_BOLD)
-    s_draw.text((ub_x + 52, ub_y + 30), "24.6 MB • 12:00 PM", fill=(100, 130, 110), font=FONT_CHAT)
+    # User Message: Uploaded APK Document Bubble (#2b5278)
+    ub_y = 80 * S
+    ub_w = 236 * S
+    ub_h = 58 * S
+    ub_x = screen_w - ub_w - 12 * S
+    s_draw.rounded_rectangle([ub_x, ub_y, ub_x + ub_w, ub_y + ub_h], radius=12 * S, fill=(43, 82, 120))
+    s_draw.ellipse([(ub_x + 10 * S, ub_y + 11 * S), (ub_x + 46 * S, ub_y + 47 * S)], fill=(65, 140, 210))
+    s_draw.text((ub_x + 18 * S, ub_y + 19 * S), "APK", fill=(255, 255, 255), font=FONT_CHAT_BOLD)
+    s_draw.text((ub_x + 54 * S, ub_y + 13 * S), "production_game.apk", fill=(255, 255, 255), font=FONT_CHAT_BOLD)
+    s_draw.text((ub_x + 54 * S, ub_y + 31 * S), "24.6 MB • 12:00 PM", fill=(160, 195, 230), font=FONT_CHAT)
+
+    # Double checkmarks
     if sec >= 0.8:
-        # Draw crisp double checkmark
-        cx = ub_x + 170
-        cy = ub_y + 36
-        s_draw.line([(cx, cy), (cx + 3, cy + 4), (cx + 8, cy - 3)], fill=(50, 160, 90), width=2)
-        s_draw.line([(cx + 5, cy), (cx + 8, cy + 4), (cx + 13, cy - 3)], fill=(50, 160, 90), width=2)
+        cx, cy = ub_x + 172 * S, ub_y + 36 * S
+        s_draw.line([(cx, cy), (cx + 3 * S, cy + 4 * S), (cx + 8 * S, cy - 3 * S)], fill=(75, 190, 120), width=2 * S)
+        s_draw.line([(cx + 5 * S, cy), (cx + 8 * S, cy + 4 * S), (cx + 13 * S, cy - 3 * S)], fill=(75, 190, 120), width=2 * S)
+    else:
+        # Animated upload progress circle
+        spin_a = (sec * 720) % 360
+        s_draw.arc([ub_x + 172 * S, ub_y + 30 * S, ub_x + 186 * S, ub_y + 44 * S], start=spin_a, end=spin_a + 270, fill=(160, 195, 230), width=2 * S)
 
-    # Bot Message - Phase 1: Thinking / Decompiling progress
-    if 1.0 <= sec < 3.2:
-        pb_y = 146
-        pb_w = 285
-        pb_h = 50
-        s_draw.rounded_rectangle([12, pb_y, 12 + pb_w, pb_y + pb_h], radius=12, fill=(255, 255, 255))
-        paste_emoji_text(screen, s_draw, 22, pb_y + 10, "⚡", "Scanning APK in parallel...", FONT_CHAT_BOLD, (40, 40, 40), 16)
-        # Progress bar
-        p_pct = min(1.0, (sec - 1.0) / 2.0)
-        s_draw.rounded_rectangle([22, pb_y + 32, 22 + int((pb_w - 44) * p_pct), pb_y + 38], radius=3, fill=(36, 129, 204))
+    # Bot Message - Stage 1 (1.0s to 3.0s): Parallel Decompiling progress
+    if 1.0 <= sec < 3.0:
+        pb_y = 148 * S
+        pb_w = 296 * S
+        pb_h = 52 * S
+        s_draw.rounded_rectangle([12 * S, pb_y, 12 * S + pb_w, pb_y + pb_h], radius=12 * S, fill=(24, 37, 51), outline=(35, 52, 70), width=1 * S)
+        paste_emoji_text(screen, s_draw, 22 * S, pb_y + 10 * S, "⚡", "Scanning APK in parallel...", FONT_CHAT_BOLD, (220, 230, 240), 16)
+        p_pct = min(1.0, (sec - 1.0) / 1.8)
+        # Background bar
+        s_draw.rounded_rectangle([22 * S, pb_y + 32 * S, 22 * S + int((pb_w - 44 * S)), pb_y + 38 * S], radius=3 * S, fill=(35, 50, 68))
+        # Active progress bar with cyan glow
+        s_draw.rounded_rectangle([22 * S, pb_y + 32 * S, 22 * S + int((pb_w - 44 * S) * p_pct), pb_y + 38 * S], radius=3 * S, fill=(40, 160, 240))
 
-    # Bot Message - Phase 2 & 3: Full Scan Report Card (3.2s to 8.5s)
-    if 3.2 <= sec < 8.5:
-        bot_y = 146
-        bot_w = 296
-        bot_h = 246
-        bot_x = 12
-        s_draw.rounded_rectangle([bot_x, bot_y, bot_x + bot_w, bot_y + bot_h], radius=14, fill=(255, 255, 255))
+    # Bot Message - Stage 2 & 3 (3.0s to 8.5s): Extraction Report & Native Colored Buttons
+    if 3.0 <= sec < 8.5:
+        bot_y = 148 * S
+        bot_w = 306 * S
+        bot_h = 246 * S
+        bot_x = 12 * S
+        s_draw.rounded_rectangle([bot_x, bot_y, bot_x + bot_w, bot_y + bot_h], radius=14 * S, fill=(24, 37, 51), outline=(35, 52, 70), width=1 * S)
 
-        paste_emoji_text(screen, s_draw, bot_x + 10, bot_y + 8, "🔥", "FIREBASE SCAN REPORT", FONT_CHAT_BOLD, (220, 80, 0), 16)
-        s_draw.line([(bot_x + 10, bot_y + 26), (bot_x + bot_w - 10, bot_y + 26)], fill=(230, 230, 230))
+        paste_emoji_text(screen, s_draw, bot_x + 10 * S, bot_y + 8 * S, "🔥", "FIREBASE SCAN REPORT", FONT_CHAT_BOLD, (255, 145, 40), 16)
+        s_draw.line([(bot_x + 10 * S, bot_y + 27 * S), (bot_x + bot_w - 10 * S, bot_y + 27 * S)], fill=(38, 55, 75))
 
-        paste_emoji_text(screen, s_draw, bot_x + 10, bot_y + 31, "📦", "Pkg: com.target.secureapp", FONT_CHAT_BOLD, (40, 40, 40), 14)
-        paste_emoji_text(screen, s_draw, bot_x + 10, bot_y + 49, "🌐", "DB: app-prod.firebaseio.com", FONT_CHAT, (0, 102, 204), 14)
-        paste_emoji_text(screen, s_draw, bot_x + 10, bot_y + 67, "🔑", "Key: AIzaSyBg98X_01qR92x", FONT_CHAT, (60, 60, 60), 14)
-        paste_emoji_text(screen, s_draw, bot_x + 10, bot_y + 85, "📡", "FCM: AAAA9xK201_9QzL0", FONT_CHAT, (60, 60, 60), 14)
-        paste_emoji_text(screen, s_draw, bot_x + 10, bot_y + 103, "👥", "Live Nodes: 1,420 Connected", FONT_CHAT_BOLD, (0, 145, 75), 14)
-        paste_emoji_text(screen, s_draw, bot_x + 10, bot_y + 121, "⏱", "Scan Duration: 1.42s (Lightning)", FONT_CHAT, (120, 120, 120), 14)
+        paste_emoji_text(screen, s_draw, bot_x + 10 * S, bot_y + 33 * S, "📦", "Package: com.target.secureapp", FONT_CHAT_BOLD, (220, 230, 240), 14)
+        paste_emoji_text(screen, s_draw, bot_x + 10 * S, bot_y + 51 * S, "🌐", "DB: app-prod.firebaseio.com", FONT_CHAT, (80, 175, 255), 14)
+        paste_emoji_text(screen, s_draw, bot_x + 10 * S, bot_y + 69 * S, "🔑", "Key: AIzaSyBg98X_01qR92x", FONT_CODE, (200, 215, 230), 14)
+        paste_emoji_text(screen, s_draw, bot_x + 10 * S, bot_y + 87 * S, "📡", "FCM: AAAA9xK201_9QzL0", FONT_CODE, (200, 215, 230), 14)
+        paste_emoji_text(screen, s_draw, bot_x + 10 * S, bot_y + 105 * S, "👥", "Live Nodes: 1,420 Connected", FONT_CHAT_BOLD, (75, 210, 130), 14)
+        paste_emoji_text(screen, s_draw, bot_x + 10 * S, bot_y + 123 * S, "⏱", "Scan Time: 1.42s (Lightning)", FONT_CHAT, (140, 165, 190), 14)
 
-        # NATIVE COLORED BUTTONS
-        btn_y = bot_y + 144
-        btn_h = 28
+        # EXACT NATIVE COLORED BUTTONS FROM USER SCREENSHOT
+        btn_y = bot_y + 144 * S
+        btn_h = 28 * S
 
-        # Row 1: Check Database Live (SUCCESS GREEN)
-        is_pressed = (6.0 <= sec <= 8.5)
-        live_btn_color = (36, 150, 80) if is_pressed else (46, 175, 96)
-        s_draw.rounded_rectangle([bot_x + 10, btn_y, bot_x + bot_w - 10, btn_y + btn_h], radius=6, fill=live_btn_color)
-        paste_emoji_text(screen, s_draw, bot_x + 58, btn_y + 6, "🔍", "Check Database Live", FONT_BTN, (255, 255, 255), 14)
+        # Row 1: Check Database Live (Success Green: #255832)
+        is_pressed = (5.8 <= sec <= 8.5)
+        live_btn_col = (48, 115, 65) if is_pressed else (37, 88, 50)
+        s_draw.rounded_rectangle([bot_x + 10 * S, btn_y, bot_x + bot_w - 10 * S, btn_y + btn_h], radius=6 * S, fill=live_btn_col, outline=(55, 130, 75), width=1 * S)
+        paste_emoji_text(screen, s_draw, bot_x + 64 * S, btn_y + 6 * S, "🔍", "Check Database Live", FONT_BTN, (255, 255, 255), 14)
 
-        # Row 2: My Scans (PRIMARY BLUE) & Statistics (SUCCESS GREEN)
-        btn_y2 = btn_y + 32
-        mid_w = (bot_w - 26) // 2
-        s_draw.rounded_rectangle([bot_x + 10, btn_y2, bot_x + 10 + mid_w, btn_y2 + btn_h], radius=6, fill=(44, 140, 220))
-        paste_emoji_text(screen, s_draw, bot_x + 28, btn_y2 + 6, "📂", "My Scans", FONT_BTN, (255, 255, 255), 14)
+        # Row 2: My Scans (Primary Teal: #20455c) & Statistics (Success Green: #255832)
+        btn_y2 = btn_y + 32 * S
+        mid_w = (bot_w - 26 * S) // 2
+        s_draw.rounded_rectangle([bot_x + 10 * S, btn_y2, bot_x + 10 * S + mid_w, btn_y2 + btn_h], radius=6 * S, fill=(32, 69, 92), outline=(45, 95, 125), width=1 * S)
+        paste_emoji_text(screen, s_draw, bot_x + 32 * S, btn_y2 + 6 * S, "📂", "My Scans", FONT_BTN, (255, 255, 255), 14)
 
-        s_draw.rounded_rectangle([bot_x + 16 + mid_w, btn_y2, bot_x + bot_w - 10, btn_y2 + btn_h], radius=6, fill=(46, 175, 96))
-        paste_emoji_text(screen, s_draw, bot_x + 24 + mid_w, btn_y2 + 6, "📊", "Statistics", FONT_BTN, (255, 255, 255), 14)
+        s_draw.rounded_rectangle([bot_x + 16 * S + mid_w, btn_y2, bot_x + bot_w - 10 * S, btn_y2 + btn_h], radius=6 * S, fill=(37, 88, 50), outline=(50, 120, 68), width=1 * S)
+        paste_emoji_text(screen, s_draw, bot_x + 28 * S + mid_w, btn_y2 + 6 * S, "📊", "Statistics", FONT_BTN, (255, 255, 255), 14)
 
-        # Row 3: Admin Suite (DANGER RED)
-        btn_y3 = btn_y2 + 32
-        s_draw.rounded_rectangle([bot_x + 10, btn_y3, bot_x + bot_w - 10, btn_y3 + btn_h], radius=6, fill=(225, 60, 60))
-        paste_emoji_text(screen, s_draw, bot_x + 40, btn_y3 + 6, "👑", "ADMIN CONTROL SUITE", FONT_BTN, (255, 255, 255), 14)
+        # Row 3: Admin Suite (Danger Red: #662a2a)
+        btn_y3 = btn_y2 + 32 * S
+        s_draw.rounded_rectangle([bot_x + 10 * S, btn_y3, bot_x + bot_w - 10 * S, btn_y3 + btn_h], radius=6 * S, fill=(102, 42, 42), outline=(140, 58, 58), width=1 * S)
+        paste_emoji_text(screen, s_draw, bot_x + 46 * S, btn_y3 + 6 * S, "👑", "ADMIN CONTROL SUITE", FONT_BTN, (255, 255, 255), 14)
 
-        # Interactive Live Modal Alert during 6.2s - 8.5s
-        if 6.2 <= sec < 8.5:
-            pop_y = bot_y + 20
-            pop_w = 270
-            pop_h = 160
+        # Interactive Finger Tap & Live Modal Alert (6.0s to 8.5s)
+        if 6.0 <= sec < 8.5:
+            # Live Probe Result Popup Modal
+            pop_y = bot_y + 20 * S
+            pop_w = 280 * S
+            pop_h = 166 * S
             pop_x = (screen_w - pop_w) // 2
-            s_draw.rounded_rectangle([pop_x, pop_y, pop_x + pop_w, pop_y + pop_h], radius=12, fill=(245, 255, 245), outline=(46, 175, 96), width=2)
-            paste_emoji_text(screen, s_draw, pop_x + 12, pop_y + 12, "🔍", "LIVE DATABASE PROBE", FONT_CHAT_BOLD, (30, 130, 60), 16)
-            s_draw.line([(pop_x + 10, pop_y + 36), (pop_x + pop_w - 10, pop_y + 36)], fill=(200, 230, 200))
-            paste_emoji_text(screen, s_draw, pop_x + 12, pop_y + 44, "🟢", "Status: OPEN & VULNERABLE", FONT_CHAT_BOLD, (0, 140, 60), 14)
-            paste_emoji_text(screen, s_draw, pop_x + 12, pop_y + 66, "📊", "Total Records: 48,290 nodes", FONT_CHAT, (50, 50, 50), 14)
-            paste_emoji_text(screen, s_draw, pop_x + 12, pop_y + 86, "👥", "Live Devices: 1,420 Connected", FONT_CHAT, (50, 50, 50), 14)
-            paste_emoji_text(screen, s_draw, pop_x + 12, pop_y + 106, "🛡️", "Auth: Read/Write Public", FONT_CHAT_BOLD, (200, 50, 50), 14)
-            s_draw.rounded_rectangle([pop_x + 60, pop_y + 128, pop_x + pop_w - 60, pop_y + 152], radius=6, fill=(46, 175, 96))
-            s_draw.text((pop_x + 85, pop_y + 132), "OK (Verified)", fill=(255, 255, 255), font=FONT_BTN)
+            # Dark Frosted Glass Modal
+            s_draw.rounded_rectangle([pop_x, pop_y, pop_x + pop_w, pop_y + pop_h], radius=14 * S, fill=(18, 30, 42), outline=(50, 130, 75), width=2 * S)
+            paste_emoji_text(screen, s_draw, pop_x + 12 * S, pop_y + 12 * S, "🔍", "LIVE DATABASE PROBE", FONT_CHAT_BOLD, (75, 210, 130), 16)
+            s_draw.line([(pop_x + 10 * S, pop_y + 36 * S), (pop_x + pop_w - 10 * S, pop_y + 36 * S)], fill=(35, 55, 75))
+            paste_emoji_text(screen, s_draw, pop_x + 12 * S, pop_y + 44 * S, "🟢", "Status: OPEN & VULNERABLE", FONT_CHAT_BOLD, (75, 220, 130), 14)
+            paste_emoji_text(screen, s_draw, pop_x + 12 * S, pop_y + 66 * S, "📊", "Total Records: 48,290 nodes", FONT_CHAT, (210, 225, 240), 14)
+            paste_emoji_text(screen, s_draw, pop_x + 12 * S, pop_y + 86 * S, "👥", "Live Devices: 1,420 Connected", FONT_CHAT, (210, 225, 240), 14)
+            paste_emoji_text(screen, s_draw, pop_x + 12 * S, pop_y + 106 * S, "🛡️", "Auth: Public Read/Write Allowed", FONT_CHAT_BOLD, (255, 110, 110), 14)
+            # Dismiss button
+            s_draw.rounded_rectangle([pop_x + 65 * S, pop_y + 130 * S, pop_x + pop_w - 65 * S, pop_y + 156 * S], radius=6 * S, fill=(37, 88, 50))
+            s_draw.text((pop_x + 94 * S, pop_y + 134 * S), "OK (Verified)", fill=(255, 255, 255), font=FONT_BTN)
 
-    # Bot Message - Phase 4: Admin Control Suite (8.5s to 11.2s)
+    # Bot Message - Stage 4 (8.5s to 11.2s): Admin Control Suite
     elif 8.5 <= sec < 11.2:
-        adm_y = 146
-        adm_w = 296
-        adm_h = 246
-        adm_x = 12
-        s_draw.rounded_rectangle([adm_x, adm_y, adm_x + adm_w, adm_y + adm_h], radius=14, fill=(255, 255, 255))
-        paste_emoji_text(screen, s_draw, adm_x + 10, adm_y + 8, "🛡️", "ADMIN CONTROL SUITE", FONT_CHAT_BOLD, (40, 40, 40), 16)
-        s_draw.line([(adm_x + 10, adm_y + 26), (adm_x + adm_w - 10, adm_y + 26)], fill=(230, 230, 230))
+        adm_y = 148 * S
+        adm_w = 306 * S
+        adm_h = 246 * S
+        adm_x = 12 * S
+        s_draw.rounded_rectangle([adm_x, adm_y, adm_x + adm_w, adm_y + adm_h], radius=14 * S, fill=(24, 37, 51), outline=(35, 52, 70), width=1 * S)
+        paste_emoji_text(screen, s_draw, adm_x + 10 * S, adm_y + 8 * S, "🛡️", "ADMIN CONTROL SUITE", FONT_CHAT_BOLD, (255, 145, 40), 16)
+        s_draw.line([(adm_x + 10 * S, adm_y + 27 * S), (adm_x + adm_w - 10 * S, adm_y + 27 * S)], fill=(38, 55, 75))
 
-        paste_emoji_text(screen, s_draw, adm_x + 10, adm_y + 32, "👥", "Total Users: 1,850 Registered", FONT_CHAT_BOLD, (40, 40, 40), 14)
-        paste_emoji_text(screen, s_draw, adm_x + 10, adm_y + 50, "📊", "Total Scans: 4,200 APKs", FONT_CHAT, (40, 40, 40), 14)
-        paste_emoji_text(screen, s_draw, adm_x + 10, adm_y + 68, "⚙️", "Maintenance: ACTIVE (Online)", FONT_CHAT_BOLD, (0, 145, 75), 14)
-        paste_emoji_text(screen, s_draw, adm_x + 10, adm_y + 86, "📦", "Storage: Channel -1003776813052", FONT_CHAT, (0, 102, 204), 14)
-        paste_emoji_text(screen, s_draw, adm_x + 10, adm_y + 104, "⏱", "Uptime: 24/7 Cloud Healer Live", FONT_CHAT, (100, 100, 100), 14)
+        paste_emoji_text(screen, s_draw, adm_x + 10 * S, adm_y + 33 * S, "👥", "Total Users: 1,850 Registered", FONT_CHAT_BOLD, (220, 230, 240), 14)
+        paste_emoji_text(screen, s_draw, adm_x + 10 * S, adm_y + 51 * S, "📊", "Total Scans: 4,200 APKs", FONT_CHAT, (220, 230, 240), 14)
+        paste_emoji_text(screen, s_draw, adm_x + 10 * S, adm_y + 69 * S, "⚙️", "Maintenance: ACTIVE (Online)", FONT_CHAT_BOLD, (75, 210, 130), 14)
+        paste_emoji_text(screen, s_draw, adm_x + 10 * S, adm_y + 87 * S, "📦", "Storage: Channel -1003776813052", FONT_CHAT, (80, 175, 255), 14)
+        paste_emoji_text(screen, s_draw, adm_x + 10 * S, adm_y + 105 * S, "⏱", "Uptime: 24/7 Cloud Healer Live", FONT_CHAT, (140, 165, 190), 14)
 
-        # Admin Buttons
-        ab_y = adm_y + 126
-        ab_h = 26
-        mid_w = (adm_w - 26) // 2
+        # Admin Action Buttons (Dark themed from user screenshot)
+        ab_y = adm_y + 126 * S
+        ab_h = 26 * S
+        mid_w = (adm_w - 26 * S) // 2
 
-        # Row 1: Refresh (Blue) | Maint (Red)
-        s_draw.rounded_rectangle([adm_x + 10, ab_y, adm_x + 10 + mid_w, ab_y + ab_h], radius=6, fill=(44, 140, 220))
-        paste_emoji_text(screen, s_draw, adm_x + 22, ab_y + 5, "🔄", "Refresh", FONT_BTN, (255, 255, 255), 12)
+        # Row 1: Refresh (Teal) | Maint (Red)
+        s_draw.rounded_rectangle([adm_x + 10 * S, ab_y, adm_x + 10 * S + mid_w, ab_y + ab_h], radius=6 * S, fill=(32, 69, 92), outline=(45, 95, 125), width=1 * S)
+        paste_emoji_text(screen, s_draw, adm_x + 22 * S, ab_y + 5 * S, "🔄", "Refresh", FONT_BTN, (255, 255, 255), 12)
 
-        s_draw.rounded_rectangle([adm_x + 16 + mid_w, ab_y, adm_x + adm_w - 10, ab_y + ab_h], radius=6, fill=(225, 60, 60))
-        paste_emoji_text(screen, s_draw, adm_x + 16 + mid_w, ab_y + 5, "⚙️", "Maint: PAUSE", FONT_BTN, (255, 255, 255), 12)
+        s_draw.rounded_rectangle([adm_x + 16 * S + mid_w, ab_y, adm_x + adm_w - 10 * S, ab_y + ab_h], radius=6 * S, fill=(102, 42, 42), outline=(140, 58, 58), width=1 * S)
+        paste_emoji_text(screen, s_draw, adm_x + 16 * S + mid_w, ab_y + 5 * S, "⚙️", "Maint: PAUSE", FONT_BTN, (255, 255, 255), 12)
 
         # Row 2: Export (Green) | Banned (Red)
-        ab_y2 = ab_y + 30
-        s_draw.rounded_rectangle([adm_x + 10, ab_y2, adm_x + 10 + mid_w, ab_y2 + ab_h], radius=6, fill=(46, 175, 96))
-        paste_emoji_text(screen, s_draw, adm_x + 16, ab_y2 + 5, "👥", "Export TXT", FONT_BTN, (255, 255, 255), 12)
+        ab_y2 = ab_y + 30 * S
+        s_draw.rounded_rectangle([adm_x + 10 * S, ab_y2, adm_x + 10 * S + mid_w, ab_y2 + ab_h], radius=6 * S, fill=(37, 88, 50), outline=(50, 120, 68), width=1 * S)
+        paste_emoji_text(screen, s_draw, adm_x + 16 * S, ab_y2 + 5 * S, "👥", "Export TXT", FONT_BTN, (255, 255, 255), 12)
 
-        s_draw.rounded_rectangle([adm_x + 16 + mid_w, ab_y2, adm_x + adm_w - 10, ab_y2 + ab_h], radius=6, fill=(225, 60, 60))
-        paste_emoji_text(screen, s_draw, adm_x + 16 + mid_w, ab_y2 + 5, "🚫", "Banned List", FONT_BTN, (255, 255, 255), 12)
+        s_draw.rounded_rectangle([adm_x + 16 * S + mid_w, ab_y2, adm_x + adm_w - 10 * S, ab_y2 + ab_h], radius=6 * S, fill=(102, 42, 42), outline=(140, 58, 58), width=1 * S)
+        paste_emoji_text(screen, s_draw, adm_x + 16 * S + mid_w, ab_y2 + 5 * S, "🚫", "Banned List", FONT_BTN, (255, 255, 255), 12)
 
-        # Row 3: Broadcast (Blue) | Archive (Green)
-        ab_y3 = ab_y2 + 30
-        s_draw.rounded_rectangle([adm_x + 10, ab_y3, adm_x + 10 + mid_w, ab_y3 + ab_h], radius=6, fill=(44, 140, 220))
-        paste_emoji_text(screen, s_draw, adm_x + 16, ab_y3 + 5, "📢", "Broadcast", FONT_BTN, (255, 255, 255), 12)
+        # Row 3: Broadcast (Teal) | Archive (Green)
+        ab_y3 = ab_y2 + 30 * S
+        s_draw.rounded_rectangle([adm_x + 10 * S, ab_y3, adm_x + 10 * S + mid_w, ab_y3 + ab_h], radius=6 * S, fill=(32, 69, 92), outline=(45, 95, 125), width=1 * S)
+        paste_emoji_text(screen, s_draw, adm_x + 16 * S, ab_y3 + 5 * S, "📢", "Broadcast", FONT_BTN, (255, 255, 255), 12)
 
-        s_draw.rounded_rectangle([adm_x + 16 + mid_w, ab_y3, adm_x + adm_w - 10, ab_y3 + ab_h], radius=6, fill=(46, 175, 96))
-        paste_emoji_text(screen, s_draw, adm_x + 14 + mid_w, ab_y3 + 5, "📦", "Archive Hub", FONT_BTN, (255, 255, 255), 12)
+        s_draw.rounded_rectangle([adm_x + 16 * S + mid_w, ab_y3, adm_x + adm_w - 10 * S, ab_y3 + ab_h], radius=6 * S, fill=(37, 88, 50), outline=(50, 120, 68), width=1 * S)
+        paste_emoji_text(screen, s_draw, adm_x + 14 * S + mid_w, ab_y3 + 5 * S, "📦", "Archive Hub", FONT_BTN, (255, 255, 255), 12)
 
-    # Bot Message - Phase 5: Main Menu & Call To Action (11.2s to 13.09s)
+    # Bot Message - Stage 5 (11.2s to 13.09s): Final Welcome & CTA
     elif sec >= 11.2:
-        wel_y = 146
-        wel_w = 296
-        wel_h = 246
-        wel_x = 12
-        s_draw.rounded_rectangle([wel_x, wel_y, wel_x + wel_w, wel_y + wel_h], radius=14, fill=(255, 255, 255))
-        paste_emoji_text(screen, s_draw, wel_x + 10, wel_y + 8, "🔥", "FIREBASE EXTRACTOR ENGINE", FONT_CHAT_BOLD, (220, 80, 0), 16)
-        s_draw.line([(wel_x + 10, wel_y + 26), (wel_x + wel_w - 10, wel_y + 26)], fill=(230, 230, 230))
+        wel_y = 148 * S
+        wel_w = 306 * S
+        wel_h = 246 * S
+        wel_x = 12 * S
+        s_draw.rounded_rectangle([wel_x, wel_y, wel_x + wel_w, wel_y + wel_h], radius=14 * S, fill=(24, 37, 51), outline=(35, 52, 70), width=1 * S)
+        paste_emoji_text(screen, s_draw, wel_x + 10 * S, wel_y + 8 * S, "🔥", "FIREBASE EXTRACTOR ENGINE", FONT_CHAT_BOLD, (255, 145, 40), 16)
+        s_draw.line([(wel_x + 10 * S, wel_y + 27 * S), (wel_x + wel_w - 10 * S, wel_y + 27 * S)], fill=(38, 55, 75))
 
-        s_draw.text((wel_x + 10, wel_y + 32), "Send any APK to instantly extract:", fill=(40, 40, 40), font=FONT_CHAT)
-        paste_emoji_text(screen, s_draw, wel_x + 10, wel_y + 50, "🌐", "Firebase Database URLs & Probes", FONT_CHAT, (0, 102, 204), 14)
-        paste_emoji_text(screen, s_draw, wel_x + 10, wel_y + 68, "🔑", "API Keys, Tokens & Auth Domains", FONT_CHAT, (50, 50, 50), 14)
-        paste_emoji_text(screen, s_draw, wel_x + 10, wel_y + 86, "👥", "Server Keys & Push Credentials", FONT_CHAT, (50, 50, 50), 14)
-        paste_emoji_text(screen, s_draw, wel_x + 10, wel_y + 104, "⚡", "Live Node & Device Statistics", FONT_CHAT_BOLD, (0, 145, 75), 14)
+        s_draw.text((wel_x + 10 * S, wel_y + 33 * S), "Send any APK to instantly extract:", fill=(210, 225, 240), font=FONT_CHAT)
+        paste_emoji_text(screen, s_draw, wel_x + 10 * S, wel_y + 51 * S, "🌐", "Firebase Database URLs & Probes", FONT_CHAT, (80, 175, 255), 14)
+        paste_emoji_text(screen, s_draw, wel_x + 10 * S, wel_y + 69 * S, "🔑", "API Keys, Tokens & Auth Domains", FONT_CHAT, (210, 225, 240), 14)
+        paste_emoji_text(screen, s_draw, wel_x + 10 * S, wel_y + 87 * S, "👥", "Server Keys & Push Credentials", FONT_CHAT, (210, 225, 240), 14)
+        paste_emoji_text(screen, s_draw, wel_x + 10 * S, wel_y + 105 * S, "⚡", "Live Node & Device Statistics", FONT_CHAT_BOLD, (75, 210, 130), 14)
 
-        wb_y = wel_y + 128
-        wb_h = 28
+        wb_y = wel_y + 128 * S
+        wb_h = 28 * S
         # Admin Suite Button (Red)
-        s_draw.rounded_rectangle([wel_x + 10, wb_y, wel_x + wel_w - 10, wb_y + wb_h], radius=6, fill=(225, 60, 60))
-        paste_emoji_text(screen, s_draw, wel_x + 38, wb_y + 6, "👑", "ADMIN CONTROL SUITE", FONT_BTN, (255, 255, 255), 14)
+        s_draw.rounded_rectangle([wel_x + 10 * S, wb_y, wel_x + wel_w - 10 * S, wb_y + wb_h], radius=6 * S, fill=(102, 42, 42), outline=(140, 58, 58), width=1 * S)
+        paste_emoji_text(screen, s_draw, wel_x + 44 * S, wb_y + 6 * S, "👑", "ADMIN CONTROL SUITE", FONT_BTN, (255, 255, 255), 14)
 
-        wb_y2 = wb_y + 32
-        mid_w = (wel_w - 26) // 2
-        s_draw.rounded_rectangle([wel_x + 10, wb_y2, wel_x + 10 + mid_w, wb_y2 + wb_h], radius=6, fill=(44, 140, 220))
-        paste_emoji_text(screen, s_draw, wel_x + 28, wb_y2 + 6, "📂", "My Scans", FONT_BTN, (255, 255, 255), 14)
+        wb_y2 = wb_y + 32 * S
+        mid_w = (wel_w - 26 * S) // 2
+        s_draw.rounded_rectangle([wel_x + 10 * S, wb_y2, wel_x + 10 * S + mid_w, wb_y2 + wb_h], radius=6 * S, fill=(32, 69, 92), outline=(45, 95, 125), width=1 * S)
+        paste_emoji_text(screen, s_draw, wel_x + 32 * S, wb_y2 + 6 * S, "📂", "My Scans", FONT_BTN, (255, 255, 255), 14)
 
-        s_draw.rounded_rectangle([wel_x + 16 + mid_w, wb_y2, wel_x + wel_w - 10, wb_y2 + wb_h], radius=6, fill=(46, 175, 96))
-        paste_emoji_text(screen, s_draw, wel_x + 24 + mid_w, wb_y2 + 6, "📊", "Statistics", FONT_BTN, (255, 255, 255), 14)
+        s_draw.rounded_rectangle([wel_x + 16 * S + mid_w, wb_y2, wel_x + wel_w - 10 * S, wb_y2 + wb_h], radius=6 * S, fill=(37, 88, 50), outline=(50, 120, 68), width=1 * S)
+        paste_emoji_text(screen, s_draw, wel_x + 28 * S + mid_w, wb_y2 + 6 * S, "📊", "Statistics", FONT_BTN, (255, 255, 255), 14)
 
-        wb_y3 = wb_y2 + 32
-        s_draw.rounded_rectangle([wel_x + 10, wb_y3, wel_x + wel_w - 10, wb_y3 + wb_h], radius=6, fill=(44, 140, 220))
-        paste_emoji_text(screen, s_draw, wel_x + 48, wb_y3 + 6, "💬", "Support Community", FONT_BTN, (255, 255, 255), 14)
+        wb_y3 = wb_y2 + 32 * S
+        s_draw.rounded_rectangle([wel_x + 10 * S, wb_y3, wel_x + wel_w - 10 * S, wb_y3 + wb_h], radius=6 * S, fill=(32, 69, 92), outline=(45, 95, 125), width=1 * S)
+        paste_emoji_text(screen, s_draw, wel_x + 48 * S, wb_y3 + 6 * S, "💬", "Support Community", FONT_BTN, (255, 255, 255), 14)
 
     # Mask screen to rounded corners
     screen_mask = Image.new("L", (screen_w, screen_h), 0)
     s_mask_draw = ImageDraw.Draw(screen_mask)
-    s_mask_draw.rounded_rectangle([0, 0, screen_w, screen_h], radius=28, fill=255)
+    s_mask_draw.rounded_rectangle([0, 0, screen_w, screen_h], radius=32 * S, fill=255)
     img.paste(screen, (screen_x, screen_y), screen_mask)
 
-    # 4. Right Side Typography Transitions
-    text_x = 438
-    text_y = 225
+    # Specular Glass Reflection Streak across screen
+    glass = Image.new("RGBA", (screen_w, screen_h), (0, 0, 0, 0))
+    gdraw = ImageDraw.Draw(glass)
+    gdraw.polygon([(0, 0), (screen_w // 2, 0), (0, screen_h // 2)], fill=(255, 255, 255, 14))
+    img.paste(glass, (screen_x, screen_y), glass)
 
-    if sec < 3.2:
+    # Animated Touch Cursor during Interactive Scene (5.4s to 6.5s)
+    if 5.4 <= sec <= 6.5:
+        cur_prog = min(1.0, (sec - 5.4) / 0.7)
+        cx = int((screen_x + 240 * S) * (1 - cur_prog) + (screen_x + 160 * S) * cur_prog)
+        cy = int((screen_y + 360 * S) * (1 - cur_prog) + (screen_y + 306 * S) * cur_prog)
+        draw.ellipse([(cx - 16 * S, cy - 16 * S), (cx + 16 * S, cy + 16 * S)], fill=(255, 255, 255, 120), outline=(255, 255, 255, 220), width=2 * S)
+        draw.ellipse([(cx - 6 * S, cy - 6 * S), (cx + 6 * S, cy + 6 * S)], fill=(255, 255, 255, 240))
+
+    # 4. Right Side Kinetic Typography
+    text_x = 438 * S
+    text_y = 225 * S
+
+    if sec < 3.0:
         draw.text((text_x, text_y), "Instant\nAPK\nIntelligence", fill=(255, 255, 255), font=FONT_SIDE)
-        draw.text((text_x, text_y + 135), "Drop any .apk file\nMulti-scan concurrently\nLightning-fast results", fill=(230, 245, 255), font=FONT_SIDE_SUB)
-    elif sec < 6.2:
+        draw.text((text_x, text_y + 140 * S), "Drop any .apk file\nMulti-scan concurrently\nLightning-fast results", fill=(225, 240, 255), font=FONT_SIDE_SUB)
+    elif sec < 6.0:
         draw.text((text_x, text_y), "Extract\nFirebase DB\n& API Keys", fill=(255, 255, 255), font=FONT_SIDE)
-        draw.text((text_x, text_y + 135), "• Realtime DB URLs\n• FCM Push Server Keys\n• Google Maps & Secrets\n• C2 RAT Detection", fill=(230, 245, 255), font=FONT_SIDE_SUB)
-    elif sec < 9.0:
+        draw.text((text_x, text_y + 140 * S), "• Realtime DB URLs\n• FCM Push Server Keys\n• Google Maps & Secrets\n• C2 RAT Detection", fill=(225, 240, 255), font=FONT_SIDE_SUB)
+    elif sec < 8.8:
         draw.text((text_x, text_y), "Native\nTelegram\nColors", fill=(255, 255, 255), font=FONT_SIDE)
-        dot_y = text_y + 135
+        dot_y = text_y + 140 * S
         for dot_color, dot_label in [((46, 175, 96), "Success Green"), ((44, 140, 220), "Primary Teal"), ((225, 60, 60), "Danger Red Admin")]:
-            draw.ellipse([(text_x, dot_y + 3), (text_x + 12, dot_y + 15)], fill=dot_color)
-            draw.text((text_x + 18, dot_y), dot_label, fill=(230, 245, 255), font=FONT_SIDE_SUB)
-            dot_y += 24
-        draw.text((text_x, dot_y + 4), "1-Tap Live Validation", fill=(255, 255, 255), font=FONT_SIDE_SUB)
+            draw.ellipse([(text_x, dot_y + 3 * S), (text_x + 12 * S, dot_y + 15 * S)], fill=dot_color)
+            draw.text((text_x + 18 * S, dot_y), dot_label, fill=(225, 240, 255), font=FONT_SIDE_SUB)
+            dot_y += 24 * S
+        draw.text((text_x, dot_y + 6 * S), "1-Tap Live Validation", fill=(255, 255, 255), font=FONT_SIDE_SUB)
     elif sec < 11.2:
         draw.text((text_x, text_y), "Admin Suite\n& Channel\nArchival", fill=(255, 255, 255), font=FONT_SIDE)
-        draw.text((text_x, text_y + 135), "• Auto-Save APK to Channel\n• Interactive Admin Panel\n• TeleCore Anti-Flood", fill=(230, 245, 255), font=FONT_SIDE_SUB)
+        draw.text((text_x, text_y + 140 * S), "• Auto-Save APK to Channel\n• Interactive Admin Panel\n• TeleCore Anti-Flood", fill=(225, 240, 255), font=FONT_SIDE_SUB)
     else:
         draw.text((text_x, text_y), "24/7 Live\nCloud Engine\n@Kkftinbot", fill=(255, 255, 255), font=FONT_SIDE)
-        draw.text((text_x, text_y + 135), "Free Forever on Render\nContinuous Keep-Alive\nTry it now on Telegram!", fill=(230, 245, 255), font=FONT_SIDE_SUB)
+        draw.text((text_x, text_y + 140 * S), "Free Forever on Render\nContinuous Keep-Alive\nTry it now on Telegram!", fill=(225, 240, 255), font=FONT_SIDE_SUB)
 
-    # Save rendered frame
+    # Downscale from 1440x1440 to 720x720 with LANCZOS for razor-sharp Retina antialiasing
+    final_img = img.resize((FINAL_W, FINAL_H), Image.Resampling.LANCZOS)
     out_path = os.path.join(FRAMES_DIR, f"frame_{frame_idx:04d}.png")
-    img.save(out_path, format="PNG")
+    final_img.save(out_path, format="PNG")
     return frame_idx
 
 def main():
     print(f"Creating frames directory: {FRAMES_DIR}")
     os.makedirs(FRAMES_DIR, exist_ok=True)
 
-    print(f"Rendering {TOTAL_FRAMES} frames across CPU cores...")
+    print(f"Rendering {TOTAL_FRAMES} Retina 2X frames across CPU cores...")
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 8) as executor:
         futures = [executor.submit(render_frame_worker, i) for i in range(TOTAL_FRAMES)]
         for f in futures:
@@ -360,7 +400,6 @@ def main():
 
     print(f"All {TOTAL_FRAMES} frames rendered successfully!")
 
-    # Verify reference audio exists
     if not os.path.exists(AUDIO_FILE):
         print("Extracting audio from reference video...")
         subprocess.run([
@@ -376,8 +415,8 @@ def main():
         "-i", AUDIO_FILE,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", "slow",
+        "-crf", "16",
         "-c:a", "aac",
         "-b:a", "128k",
         "-shortest",
@@ -386,7 +425,6 @@ def main():
     subprocess.run(cmd, check=True)
     print(f"Successfully generated showcase video at: {OUTPUT_VIDEO}")
 
-    # Clean up frames to free temp space
     shutil.rmtree(FRAMES_DIR, ignore_errors=True)
     print("Temporary frames cleaned up.")
 
