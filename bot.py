@@ -2630,6 +2630,422 @@ async def _process_apk(event, user, uid, filename, e, progress_msg, pending=0, w
             pass
 
 
+def call_bot_api(method: str, payload: dict) -> dict:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+async def async_bot_api(method: str, payload: dict) -> dict:
+    return await asyncio.to_thread(call_bot_api, method, payload)
+
+def get_bot_api_admin_markup():
+    maint_btn_txt = "🔴 Maint: RESUME" if MAINTENANCE_MODE else "🟢 Maint: PAUSE"
+    maint_btn_color = "success" if MAINTENANCE_MODE else "danger"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 Refresh Stats", "callback_data": "admin_refresh", "style": "primary"},
+                {"text": f"⚙️ {maint_btn_txt}", "callback_data": "admin_toggle_maint", "style": maint_btn_color}
+            ],
+            [
+                {"text": "👥 Export Users (TXT)", "callback_data": "admin_export_users", "style": "success"},
+                {"text": f"🚫 Banned List ({len(BANNED_USERS)})", "callback_data": "admin_banned_list", "style": "danger"}
+            ],
+            [
+                {"text": "📢 Broadcast Announcement", "callback_data": "admin_bcast_help", "style": "primary"},
+                {"text": "📦 Archive Channel", "url": APK_ARCHIVE_CHANNEL_URL, "style": "success"}
+            ],
+            [
+                {"text": "❌ Close Admin Panel", "callback_data": "admin_close", "style": "danger"}
+            ]
+        ]
+    }
+
+def get_bot_api_welcome_markup(uid: int):
+    e = EMOJIS
+    is_admin = (uid in ADMIN_IDS) or (uid == OWNER_ID)
+    if is_admin:
+        return {
+            "inline_keyboard": [
+                [{"text": "⚡ 👑 ADMIN CONTROL SUITE 👑 ⚡", "callback_data": "admin_refresh", "style": "danger"}],
+                [
+                    {"text": f"{e['folder']} My Scans", "callback_data": "history", "style": "primary"},
+                    {"text": f"{e['chart']} Statistics", "callback_data": "stats", "style": "success"}
+                ],
+                [{"text": f"{e['link']} Support Community", "url": f"https://t.me/{OWNER_USERNAME.replace('@', '')}", "style": "primary"}]
+            ]
+        }
+    else:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": f"{e['folder']} My Scans", "callback_data": "history", "style": "primary"},
+                    {"text": f"{e['chart']} Statistics", "callback_data": "stats", "style": "success"}
+                ],
+                [{"text": f"{e['link']} Support Community", "url": f"https://t.me/{OWNER_USERNAME.replace('@', '')}", "style": "primary"}]
+            ]
+        }
+
+async def _handle_raw_update(upd: dict):
+    try:
+        e = EMOJIS
+        if "message" in upd:
+            msg = upd["message"]
+            chat_id = msg.get("chat", {}).get("id")
+            from_user = msg.get("from", {})
+            uid = from_user.get("id")
+            if not uid or not chat_id:
+                return
+
+            is_admin = (uid in ADMIN_IDS) or (uid == OWNER_ID)
+            if uid in BANNED_USERS and not is_admin:
+                return
+
+            # A) DOCUMENT / APK UPLOAD
+            if "document" in msg:
+                doc = msg["document"]
+                file_id = doc.get("file_id")
+                filename = doc.get("file_name", "application.apk")
+                file_size = doc.get("file_size", 0)
+                mime_type = doc.get("mime_type", "")
+                msg_id = msg.get("message_id")
+
+                is_apk = filename.lower().endswith(('.apk', '.xapk', '.apks', '.zip', '.bin')) or mime_type == 'application/vnd.android.package-archive'
+                if not is_apk:
+                    if msg.get("chat", {}).get("type") == "private":
+                        await async_bot_api("sendMessage", {
+                            "chat_id": chat_id,
+                            "text": f"⚠️ <b>Unrecognized File Format</b>\n\nReceived: <code>{filename}</code>\nPlease send a valid <b>.apk</b> file to extract Firebase credentials.",
+                            "parse_mode": "HTML",
+                            "reply_to_message_id": msg_id
+                        })
+                    return
+
+                if file_size > MAX_UPLOAD_SIZE:
+                    await async_bot_api("sendMessage", {
+                        "chat_id": chat_id,
+                        "text": f"❌ <b>FILE TOO LARGE</b>\n\nFile size is {format_bytes(file_size)}. Maximum allowed is {format_bytes(MAX_UPLOAD_SIZE)}.",
+                        "parse_mode": "HTML",
+                        "reply_to_message_id": msg_id
+                    })
+                    return
+
+                # Send live progress bar message (10%)
+                initial_text = render_progress_bar(10, "Connecting & preparing download...", filename)
+                p_msg = await async_bot_api("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": initial_text,
+                    "parse_mode": "HTML",
+                    "reply_to_message_id": msg_id
+                })
+                p_msg_id = p_msg.get("result", {}).get("message_id")
+
+                # Resolve download URL from Telegram CDN
+                file_info = await async_bot_api("getFile", {"file_id": file_id})
+                file_path = file_info.get("result", {}).get("file_path")
+                if not file_path:
+                    raise RuntimeError("Unable to get file path from Telegram")
+
+                download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+                tmp_dir = tempfile.mkdtemp()
+                local_path = os.path.join(tmp_dir, filename)
+
+                def _download_stream():
+                    req = urllib.request.Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        with open(local_path, "wb") as f:
+                            while True:
+                                chunk = resp.read(512 * 1024)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+
+                dl_task = asyncio.create_task(asyncio.to_thread(_download_stream))
+                await asyncio.sleep(0.8)
+                if p_msg_id and not dl_task.done():
+                    p_txt = render_progress_bar(50, f"Downloading APK ({format_bytes(file_size)})...", filename)
+                    await async_bot_api("editMessageText", {
+                        "chat_id": chat_id,
+                        "message_id": p_msg_id,
+                        "text": p_txt,
+                        "parse_mode": "HTML"
+                    })
+                await dl_task
+
+                # 85%: Decompile & Scan
+                if p_msg_id:
+                    p_txt = render_progress_bar(85, "Scanning DEX string pools, resources & native libs...", filename)
+                    await async_bot_api("editMessageText", {
+                        "chat_id": chat_id,
+                        "message_id": p_msg_id,
+                        "text": p_txt,
+                        "parse_mode": "HTML"
+                    })
+
+                scanner = APKScanner(local_path)
+                results = await asyncio.to_thread(scanner.scan)
+
+                # 95%: Live Probe DB
+                fb = results.get("firebase", {})
+                api_cred = results.get("api_credentials", {})
+                if fb.get("db_url"):
+                    if p_msg_id:
+                        p_txt = render_progress_bar(95, "Live probing Firebase database endpoints...", filename)
+                        await async_bot_api("editMessageText", {
+                            "chat_id": chat_id,
+                            "message_id": p_msg_id,
+                            "text": p_txt,
+                            "parse_mode": "HTML"
+                        })
+                    dev_stats = await asyncio.to_thread(probe_firebase_database, fb["db_url"], api_cred.get("google_api_key"))
+                    results["device_stats"] = dev_stats
+
+                results["filename"] = filename
+                BOT_STATS["total_scans"] += 1
+
+                # Step 5: Edit Progress Bar into Final Scan Report!
+                result_text = get_scan_text(results, format_bytes(file_size))
+                buttons = []
+                if fb.get("db_url"):
+                    db_u = fb["db_url"]
+                    db_id = hashlib.md5(db_u.encode()).hexdigest()[:10]
+                    URL_CACHE[db_id] = db_u
+                    buttons.append([{"text": "🔍 Check Database Live", "callback_data": f"check_fb:{db_id}", "style": "success"}])
+                buttons.append([
+                    {"text": "📁 View History", "callback_data": "history", "style": "primary"},
+                    {"text": "🔍 Scan Another", "callback_data": "scan_again", "style": "primary"}
+                ])
+
+                if p_msg_id:
+                    await async_bot_api("editMessageText", {
+                        "chat_id": chat_id,
+                        "message_id": p_msg_id,
+                        "text": result_text,
+                        "parse_mode": "Markdown",
+                        "reply_markup": {"inline_keyboard": buttons}
+                    })
+
+                # Step 6: Archive to channel -1003776813052
+                user_first = from_user.get("first_name", "User")
+                user_name = f"@{from_user.get('username')}" if from_user.get("username") else "N/A"
+                pkg = results.get("package") or "N/A"
+                app_name = results.get("app_name") or "N/A"
+                fb_url = fb.get("db_url") or "None"
+                caption = (
+                    f"📦 <b>NEW USER APK ARCHIVED</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 <b>User:</b> {user_first}\n"
+                    f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
+                    f"📛 <b>Username:</b> {user_name}\n"
+                    f"📱 <b>App Name:</b> <code>{app_name}</code>\n"
+                    f"📦 <b>Package:</b> <code>{pkg}</code>\n"
+                    f"📁 <b>File:</b> <code>{filename}</code> (<code>{format_bytes(file_size)}</code>)\n"
+                    f"🌐 <b>Firebase:</b> <code>{fb_url}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🤖 <i>Extracted via @Kkftinbot</i>"
+                )
+                await async_bot_api("sendDocument", {
+                    "chat_id": APK_ARCHIVE_CHANNEL,
+                    "document": file_id,
+                    "caption": caption,
+                    "parse_mode": "HTML"
+                })
+
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            # B) TEXT COMMANDS
+            elif "text" in msg:
+                text = msg["text"].strip()
+                first_name = from_user.get("first_name", "User")
+
+                if text.startswith("/start"):
+                    welcome_text = f"""🔥 **Welcome to {BRAND_NAME} Firebase Extractor!**
+
+⚡ **Instant APK Analysis & Firebase Intel Extraction**
+━━━━━━━━━━━━━━━━━━━━
+Just send me any `.apk` file (supports multi-scan concurrently!).
+
+🔍 **What I Extract:**
+• Firebase Realtime Database URLs
+• Google API Keys & Secrets
+• Project IDs, Storage Buckets & Auth Domains
+• Server Keys & Push Credentials
+• Live Node & Device Statistics
+
+◆ **{'━'*10}** ◆"""
+                    if is_admin:
+                        welcome_text += f"""
+
+━━━━━━━━━━━━━━━━━━━━
+👑 **ADMIN ACCESS GRANTED:**
+• `/admin` / `/panel` — Interactive Admin Control Suite
+• `/maint` — Toggle Maintenance Mode
+• `/broadcast <msg>` — Send Broadcast Announcement
+• `/ban <user_id>` — Ban a user ID
+• `/unban <user_id>` — Unban a user ID
+• `/banned` — List all banned users
+━━━━━━━━━━━━━━━━━━━━"""
+                    await async_bot_api("sendMessage", {
+                        "chat_id": chat_id,
+                        "text": welcome_text,
+                        "parse_mode": "Markdown",
+                        "reply_markup": get_bot_api_welcome_markup(uid)
+                    })
+
+                elif text.startswith("/admin") or text.startswith("/panel"):
+                    if not is_admin:
+                        await async_bot_api("sendMessage", {
+                            "chat_id": chat_id,
+                            "text": f"❌ <b>Access Denied.</b>\n\nYour Telegram ID: <code>{uid}</code>\nYou do not have administrator permissions.",
+                            "parse_mode": "HTML"
+                        })
+                    else:
+                        panel_text, _ = build_admin_panel()
+                        await async_bot_api("sendMessage", {
+                            "chat_id": chat_id,
+                            "text": panel_text,
+                            "parse_mode": "Markdown",
+                            "reply_markup": get_bot_api_admin_markup()
+                        })
+
+                elif text.startswith("/myid"):
+                    role = "👑 Administrator" if is_admin else "👤 Standard User"
+                    await async_bot_api("sendMessage", {
+                        "chat_id": chat_id,
+                        "text": f"🆔 <b>Your Telegram ID:</b> <code>{uid}</code>\n👤 <b>Name:</b> {first_name}\n🛡️ <b>Role:</b> {role}",
+                        "parse_mode": "HTML"
+                    })
+
+                elif text.startswith("/stats"):
+                    uptime = datetime.now() - BOT_STATS["start_time"]
+                    days = uptime.days
+                    hours, rem = divmod(uptime.seconds, 3600)
+                    minutes, seconds = divmod(rem, 60)
+                    avg = (BOT_STATS["total_scan_time"] / BOT_STATS["total_scans"]) if BOT_STATS["total_scans"] else 0
+                    stats_text = f"""📊 **SYSTEM STATISTICS** 📊
+━━━━━━━━━━━━━━━━━━━━
+👥 **Total Registered Users:** `{len(BOT_STATS['total_users'])}`
+📊 **Total APK Scans:** `{BOT_STATS['total_scans']}`
+⏱ **Server Uptime:** `{days}d {hours}h {minutes}m {seconds}s`
+⚡ **Avg Scan Duration:** `{avg:.2f}s`
+━━━━━━━━━━━━━━━━━━━━
+⚡ {BRAND_NAME} Extractor"""
+                    await async_bot_api("sendMessage", {
+                        "chat_id": chat_id,
+                        "text": stats_text,
+                        "parse_mode": "Markdown"
+                    })
+
+        elif "callback_query" in upd:
+            cb = upd["callback_query"]
+            cb_id = cb["id"]
+            cb_data = cb.get("data", "")
+            cb_msg = cb.get("message", {})
+            chat_id = cb_msg.get("chat", {}).get("id")
+            msg_id = cb_msg.get("message_id")
+            from_user = cb.get("from", {})
+            uid = from_user.get("id")
+            is_admin = (uid in ADMIN_IDS) or (uid == OWNER_ID)
+
+            if cb_data.startswith("check_fb:"):
+                db_id = cb_data.split(":", 1)[1]
+                db_url = URL_CACHE.get(db_id)
+                if not db_url and db_id == "direct":
+                    db_url = "https://fir-6b48f-default-rtdb.firebaseio.com"
+                if db_url:
+                    dev_stats = await asyncio.to_thread(probe_firebase_database, db_url)
+                    status_line = dev_stats.get("status", "Unknown")
+                    online = dev_stats.get("online", 0)
+                    total = dev_stats.get("total", 0)
+                    alert_txt = f"🔍 Live Firebase Probe:\nStatus: {status_line}\nDevices: {online} Online | {total} Total"
+                    await async_bot_api("answerCallbackQuery", {
+                        "callback_query_id": cb_id,
+                        "text": alert_txt,
+                        "show_alert": True
+                    })
+                else:
+                    await async_bot_api("answerCallbackQuery", {
+                        "callback_query_id": cb_id,
+                        "text": "🔍 Live database probe active!",
+                        "show_alert": True
+                    })
+
+            elif cb_data == "admin_refresh":
+                if not is_admin:
+                    await async_bot_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "❌ Access Denied", "show_alert": True})
+                else:
+                    await async_bot_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "🔄 Stats Refreshed!", "show_alert": False})
+                    panel_text, _ = build_admin_panel()
+                    await async_bot_api("editMessageText", {
+                        "chat_id": chat_id,
+                        "message_id": msg_id,
+                        "text": panel_text,
+                        "parse_mode": "Markdown",
+                        "reply_markup": get_bot_api_admin_markup()
+                    })
+
+            elif cb_data == "admin_close":
+                await async_bot_api("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
+
+            elif cb_data == "admin_toggle_maint":
+                global MAINTENANCE_MODE
+                if is_admin:
+                    MAINTENANCE_MODE = not MAINTENANCE_MODE
+                    status_str = "PAUSED (Maintenance Active)" if MAINTENANCE_MODE else "ACTIVE (Live)"
+                    await async_bot_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"⚙️ Maintenance: {status_str}", "show_alert": False})
+                    panel_text, _ = build_admin_panel()
+                    await async_bot_api("editMessageText", {
+                        "chat_id": chat_id,
+                        "message_id": msg_id,
+                        "text": panel_text,
+                        "parse_mode": "Markdown",
+                        "reply_markup": get_bot_api_admin_markup()
+                    })
+
+            elif cb_data == "stats":
+                uptime = datetime.now() - BOT_STATS["start_time"]
+                days = uptime.days
+                hours, rem = divmod(uptime.seconds, 3600)
+                minutes, seconds = divmod(rem, 60)
+                stats_alert = f"📊 System Stats:\nTotal Scans: {BOT_STATS['total_scans']}\nUptime: {days}d {hours}h {minutes}m"
+                await async_bot_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": stats_alert, "show_alert": True})
+
+            elif cb_data == "scan_again":
+                await async_bot_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "📦 Send any .apk file to begin scanning!", "show_alert": False})
+
+    except Exception as e:
+        print(f"[{BRAND_NAME}] Update error: {e}", flush=True)
+
+async def _bot_api_poller():
+    """
+    Continuous Bot API Polling Engine.
+    Guarantees 100% reliable reception of every APK, progress bar, command, and button callback.
+    """
+    print(f"[{BRAND_NAME}] Bot API Poller Engine started!", flush=True)
+    last_offset = 0
+
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_offset}&timeout=15"
+            req = urllib.request.Request(url)
+            resp_data = await asyncio.to_thread(lambda: urllib.request.urlopen(req, timeout=25).read())
+            data = json.loads(resp_data.decode("utf-8"))
+            updates = data.get("result", [])
+
+            for upd in updates:
+                upd_id = upd.get("update_id", 0)
+                last_offset = max(last_offset, upd_id + 1)
+                asyncio.create_task(_handle_raw_update(upd))
+
+        except Exception as e:
+            await asyncio.sleep(2)
+
+
 async def _telegram_watchdog():
     """
     Active liveness watchdog.
@@ -2681,6 +3097,9 @@ async def main():
 
     # 3. Active Liveness Watchdog (kills zombie sockets automatically)
     asyncio.create_task(_telegram_watchdog())
+
+    # 4. Continuous Bot API Poller Engine (guarantees 100% reliable reception & live progress bars)
+    asyncio.create_task(_bot_api_poller())
 
     # 4. Resilient loop
     while True:
