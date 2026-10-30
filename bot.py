@@ -136,7 +136,18 @@ def ensure_admin_menu(uid: int):
         pass
 
 # ==================== DATA STORAGE ====================
-USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd(), "users.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+USERS_FILE = os.path.join(BASE_DIR, "users.json")
+
+# Restore users & state from Turso Cloud (Zero Data Loss)
+try:
+    from turso_sync import TursoCloudManager
+    TursoCloudManager("firebase_bot", Path(BASE_DIR)).restore_all({
+        "users": "users.json",
+        "banned": "banned.json"
+    })
+except Exception:
+    pass
 
 def load_users():
     users = set([OWNER_ID])
@@ -175,6 +186,9 @@ def save_user(uid):
             with open(tmp_file, "w") as f:
                 json.dump(list(BOT_STATS["total_users"]), f)
             os.replace(tmp_file, USERS_FILE)
+            # Sync to Turso Cloud
+            from turso_sync import TursoCloudManager
+            TursoCloudManager("firebase_bot", Path(BASE_DIR)).set_async("users", json.dumps(list(BOT_STATS["total_users"])))
         except Exception:
             pass
 
