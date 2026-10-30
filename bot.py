@@ -3165,6 +3165,14 @@ async def main():
     port = int(os.environ.get("PORT", "10000"))
     asyncio.create_task(_health_server(port))
 
+    # Cloud Backup, Pin & Disaster Recovery Daemon
+    try:
+        from audit_cloud_manager import start_backup_daemon
+        start_backup_daemon(interval_seconds=15 * 60)
+        print(f"[{BRAND_NAME}] ☁️ Auto Cloud Backup & Pin Daemon active! ✅", flush=True)
+    except Exception as e:
+        print(f"[{BRAND_NAME}] ⚠️ Error starting backup daemon: {e}", flush=True)
+
     # 2. Initial connection
     try:
         await client.start(bot_token=BOT_TOKEN)
@@ -3230,7 +3238,16 @@ async def _health_handle(reader, writer):
     except Exception:
         pass
 
-    if path == "/status":
+    if path == "/backup_and_pin":
+        try:
+            from audit_cloud_manager import dispatch_and_pin_backup
+            res = dispatch_and_pin_backup(trigger_reason="3-Hour Scheduled Restart Checkpoint")
+            body = json.dumps(res).encode()
+            resp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            resp = f"HTTP/1.1 500 Internal Error\r\nContent-Type: application/json\r\nContent-Length: {len(err)}\r\nConnection: close\r\n\r\n".encode() + err
+    elif path == "/status":
         try:
             connected = client.is_connected() if client else False
             authorized = False
