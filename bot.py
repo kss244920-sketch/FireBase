@@ -3168,7 +3168,7 @@ async def main():
     # Cloud Backup, Pin & Disaster Recovery Daemon
     try:
         from audit_cloud_manager import start_backup_daemon
-        start_backup_daemon(interval_seconds=15 * 60)
+        start_backup_daemon(interval_seconds=3 * 3600)
         print(f"[{BRAND_NAME}] ☁️ Auto Cloud Backup & Pin Daemon active! ✅", flush=True)
     except Exception as e:
         print(f"[{BRAND_NAME}] ⚠️ Error starting backup daemon: {e}", flush=True)
